@@ -150,6 +150,10 @@ app.post("/api/twilio/voice", async (req, res) => {
   }
 });
 
+app.get("/", (req, res) => {
+  res.send("Server is running 🚀");
+});
+
 app.post("/api/twilio/process", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
