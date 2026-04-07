@@ -5,7 +5,8 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
 const {
   SUPABASE_URL,
@@ -58,6 +59,10 @@ function twimlSay(message) {
       <Say>${escapeXml(message)}</Say>
     </Response>
   `;
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function getProcessActionUrl(req, callId) {
@@ -142,6 +147,7 @@ app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
   try {
+    const welcomeMessage = "Welcome to AI support.";
     const callId = randomUUID();
     const processActionUrl = getProcessActionUrl(req, callId);
 
@@ -149,10 +155,18 @@ app.post("/api/twilio/voice", async (req, res) => {
     if (error) {
       console.error("Failed to store call:", error.message);
     }
+    const { error: welcomeInsertError } = await supabase.from("messages").insert({
+      call_id: callId,
+      role: "assistant",
+      content: welcomeMessage
+    });
+    if (welcomeInsertError) {
+      console.error("Failed to store welcome message:", welcomeInsertError.message);
+    }
 
     res.send(`
       <Response>
-        <Say>Welcome to AI support.</Say>
+        <Say>${escapeXml(welcomeMessage)}</Say>
         <Gather input="speech" action="${escapeXml(processActionUrl)}" method="POST">
           <Say>Please tell me your issue.</Say>
         </Gather>
@@ -172,16 +186,27 @@ app.post("/api/twilio/process", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
   try {
-    const userInput = String(req.body.SpeechResult || "").trim();
-    const callId = String(req.query.call_id || "").trim();
+    console.log("🔥 /api/twilio/process hit");
+    console.log("Twilio body:", req.body);
+    console.log("Twilio query:", req.query);
+
+    const userInput = String(req.body.SpeechResult || "No speech detected").trim();
+    const incomingCallId = String(req.query.call_id || "").trim();
+    const callId = isUuid(incomingCallId) ? incomingCallId : randomUUID();
+
+    if (!isUuid(incomingCallId)) {
+      console.warn("Missing/invalid call_id query param. Generated fallback call_id.");
+      const { error: fallbackCallError } = await supabase.from("calls").insert({ id: callId });
+      if (fallbackCallError) {
+        console.error("Failed to create fallback call row:", fallbackCallError.message);
+      }
+    }
 
     const userMessage = {
+      call_id: callId,
       role: "user",
       content: userInput
     };
-    if (callId) {
-      userMessage.call_id = callId;
-    }
 
     const { error: userInsertError } = await supabase.from("messages").insert(userMessage);
     if (userInsertError) {
@@ -191,12 +216,10 @@ app.post("/api/twilio/process", async (req, res) => {
     const aiResponse = await getAIResponse(userInput);
 
     const assistantMessage = {
+      call_id: callId,
       role: "assistant",
       content: aiResponse
     };
-    if (callId) {
-      assistantMessage.call_id = callId;
-    }
 
     const { error: assistantInsertError } = await supabase.from("messages").insert(assistantMessage);
     if (assistantInsertError) {
