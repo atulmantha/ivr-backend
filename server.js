@@ -10,6 +10,7 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
   GEMINI_API_KEY,
+  APP_BASE_URL,
   PORT
 } = process.env;
 
@@ -56,6 +57,11 @@ function twimlSay(message) {
       <Say>${escapeXml(message)}</Say>
     </Response>
   `;
+}
+
+function getProcessActionUrl(req) {
+  const base = (APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
+  return `${base}/api/twilio/process`;
 }
 
 async function generateEmbedding(text) {
@@ -131,6 +137,8 @@ app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
   try {
+    const processActionUrl = getProcessActionUrl(req);
+
     const { error } = await supabase.from("calls").insert({});
     if (error) {
       console.error("Failed to store call:", error.message);
@@ -139,7 +147,7 @@ app.post("/api/twilio/voice", async (req, res) => {
     res.send(`
       <Response>
         <Say>Welcome to AI support.</Say>
-        <Gather input="speech" action="/api/twilio/process" method="POST">
+        <Gather input="speech" action="${escapeXml(processActionUrl)}" method="POST">
           <Say>Please tell me your issue.</Say>
         </Gather>
       </Response>
@@ -159,21 +167,32 @@ app.post("/api/twilio/process", async (req, res) => {
 
   try {
     const userInput = String(req.body.SpeechResult || "").trim();
+    const callId = String(req.body.CallSid || "").trim();
 
-    const { error: userInsertError } = await supabase.from("messages").insert({
+    const userMessage = {
       role: "user",
       content: userInput
-    });
+    };
+    if (callId) {
+      userMessage.call_id = callId;
+    }
+
+    const { error: userInsertError } = await supabase.from("messages").insert(userMessage);
     if (userInsertError) {
       console.error("Failed to store user message:", userInsertError.message);
     }
 
     const aiResponse = await getAIResponse(userInput);
 
-    const { error: assistantInsertError } = await supabase.from("messages").insert({
+    const assistantMessage = {
       role: "assistant",
       content: aiResponse
-    });
+    };
+    if (callId) {
+      assistantMessage.call_id = callId;
+    }
+
+    const { error: assistantInsertError } = await supabase.from("messages").insert(assistantMessage);
     if (assistantInsertError) {
       console.error("Failed to store assistant message:", assistantInsertError.message);
     }
