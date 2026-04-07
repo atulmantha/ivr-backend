@@ -1,5 +1,7 @@
 const express = require("express");
 const { randomUUID } = require("crypto");
+const multer = require("multer");
+const pdfParse = require("pdf-parse");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
@@ -7,6 +9,7 @@ require("dotenv").config();
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+const upload = multer({ storage: multer.memoryStorage() });
 
 const {
   SUPABASE_URL,
@@ -180,6 +183,78 @@ app.post("/api/twilio/voice", async (req, res) => {
 
 app.get("/", (req, res) => {
   res.send("Server is running 🚀");
+});
+
+app.post("/api/upload-pdf", upload.single("file"), async (req, res) => {
+  try {
+    console.log("Upload route hit: /api/upload-pdf");
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded (field must be 'file')." });
+    }
+
+    if (!req.file.buffer) {
+      return res.status(400).json({ error: "Uploaded file buffer is missing." });
+    }
+
+    if (req.file.mimetype !== "application/pdf") {
+      return res.status(400).json({ error: "Only PDF files are supported." });
+    }
+
+    const pdfData = await pdfParse(req.file.buffer);
+    const text = String(pdfData?.text || "").trim();
+
+    if (!text) {
+      return res.status(400).json({ error: "Uploaded PDF appears empty or unreadable." });
+    }
+
+    // Prefer paragraph chunks for better semantic retrieval; fallback to fixed-size chunks.
+    const paragraphChunks = text
+      .split(/\n\s*\n/)
+      .map((chunk) => chunk.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+
+    const chunks = paragraphChunks.length > 0
+      ? paragraphChunks
+      : (text.match(/[\s\S]{1,500}/g) || []).map((chunk) => chunk.trim()).filter(Boolean);
+
+    let insertedCount = 0;
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      let embedding;
+      try {
+        embedding = await generateEmbedding(chunk);
+      } catch (error) {
+        throw new Error(`Embedding failed at chunk ${i + 1}: ${error.message}`);
+      }
+
+      if (!embedding) {
+        continue;
+      }
+
+      const { error } = await supabase.from("knowledge").insert({
+        content: chunk,
+        embedding
+      });
+
+      if (error) {
+        throw new Error(
+          `Supabase insert failed at chunk ${i + 1}: ${error.message} (code: ${error.code || "n/a"})`
+        );
+      }
+
+      insertedCount += 1;
+    }
+
+    return res.json({
+      message: "PDF processed and stored successfully.",
+      chunks_processed: chunks.length,
+      chunks_inserted: insertedCount
+    });
+  } catch (error) {
+    console.error("upload-pdf error:", error);
+    return res.status(500).json({ error: error?.message || "Failed to process PDF" });
+  }
 });
 
 app.post("/api/twilio/process", async (req, res) => {
