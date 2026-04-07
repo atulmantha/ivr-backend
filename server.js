@@ -93,6 +93,17 @@ async function generateEmbedding(text) {
   return embedding;
 }
 
+async function getAIResponseWithTimeout(query, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await getAIResponse(query, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 async function searchSimilar(queryEmbedding) {
   if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
     return [];
@@ -118,7 +129,7 @@ async function searchSimilar(queryEmbedding) {
     .slice(0, 3);
 }
 
-async function getAIResponse(query) {
+async function getAIResponse(query, options = {}) {
   const cleanedQuery = String(query || "").trim();
   if (!cleanedQuery) {
     return "I did not catch that. Please tell me your issue again.";
@@ -131,16 +142,16 @@ async function getAIResponse(query) {
     : "No relevant context found.";
 
   const prompt = [
-    "Answer using the following context:",
-    context,
+    "Answer the question clearly in a short conversational voice response.",
+    "If no useful context is found, answer normally.",
     "",
-    `User question: ${cleanedQuery}`,
+    `Question: ${cleanedQuery}`,
+    `Context: ${context || "No context available"}`,
     "",
-    "Give a short spoken response.",
-    "Keep it conversational and no more than 2 sentences."
+    "Keep it to no more than 2 sentences."
   ].join("\n");
 
-  const result = await chatModel.generateContent(prompt);
+  const result = await chatModel.generateContent(prompt, options);
   const rawText = result?.response?.text?.() || "";
 
   return toVoiceFriendlyResponse(rawText);
@@ -288,7 +299,16 @@ app.post("/api/twilio/process", async (req, res) => {
       console.error("Failed to store user message:", userInsertError.message);
     }
 
-    const aiResponse = await getAIResponse(userInput);
+    let aiResponse = "Sorry, I couldn't process your request. Please try again.";
+    try {
+      const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 8000;
+      const result = await getAIResponseWithTimeout(userInput, timeoutMs);
+      if (result) {
+        aiResponse = result;
+      }
+    } catch (error) {
+      console.error("AI error:", error);
+    }
 
     const assistantMessage = {
       call_id: callId,
