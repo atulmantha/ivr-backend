@@ -1,4 +1,5 @@
 const express = require("express");
+const { randomUUID } = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
@@ -59,9 +60,13 @@ function twimlSay(message) {
   `;
 }
 
-function getProcessActionUrl(req) {
+function getProcessActionUrl(req, callId) {
   const base = (APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
-  return `${base}/api/twilio/process`;
+  const url = new URL(`${base}/api/twilio/process`);
+  if (callId) {
+    url.searchParams.set("call_id", callId);
+  }
+  return url.toString();
 }
 
 async function generateEmbedding(text) {
@@ -137,9 +142,10 @@ app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
   try {
-    const processActionUrl = getProcessActionUrl(req);
+    const callId = randomUUID();
+    const processActionUrl = getProcessActionUrl(req, callId);
 
-    const { error } = await supabase.from("calls").insert({});
+    const { error } = await supabase.from("calls").insert({ id: callId });
     if (error) {
       console.error("Failed to store call:", error.message);
     }
@@ -167,7 +173,7 @@ app.post("/api/twilio/process", async (req, res) => {
 
   try {
     const userInput = String(req.body.SpeechResult || "").trim();
-    const callId = String(req.body.CallSid || "").trim();
+    const callId = String(req.query.call_id || "").trim();
 
     const userMessage = {
       role: "user",
