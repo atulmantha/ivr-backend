@@ -30,7 +30,7 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const chatModel = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   generationConfig: {
-    maxOutputTokens: 100,
+    maxOutputTokens: 180,
     temperature: 0.4
   }
 });
@@ -60,18 +60,6 @@ function toVoiceFriendlyResponse(text) {
   const sentences = normalized.match(/[^.!?]+[.!?]?/g) || [];
   const firstTwo = sentences.slice(0, 2).join(" ").trim();
   return firstTwo || normalized.slice(0, 220);
-}
-
-function withFollowUp(text) {
-  const base = toVoiceFriendlyResponse(text);
-  const cleaned = base.replace(/[.!?]+$/g, "").trim();
-  const sentences = cleaned.match(/[^.!?]+[.!?]?/g) || [];
-
-  if (sentences.length >= 2) {
-    return toVoiceFriendlyResponse(cleaned);
-  }
-
-  return `${cleaned}. What else can I help with?`;
 }
 
 function twimlSay(message) {
@@ -215,14 +203,13 @@ async function getAIResponse(query, options = {}) {
     `Question: ${cleanedQuery}`,
     `Context: ${context || "No context available"}`,
     "",
-    "Return at most 2 short conversational sentences.",
-    "End with: What else can I help with?"
+    "Return at most 2 short conversational sentences."
   ].join("\n");
 
   const result = await chatModel.generateContent(prompt, options);
   const rawText = result?.response?.text?.() || "";
 
-  return withFollowUp(rawText);
+  return toVoiceFriendlyResponse(rawText);
 }
 
 app.post("/api/twilio/voice", async (req, res) => {
@@ -389,7 +376,16 @@ app.post("/api/twilio/process", async (req, res) => {
       console.error("Failed to store assistant message:", assistantInsertError.message);
     }
 
-    res.send(twimlSay(aiResponse));
+    const nextActionUrl = getProcessActionUrl(req, callId);
+    res.send(`
+      <Response>
+        <Say>${escapeXml(aiResponse)}</Say>
+        <Gather input="speech" action="${escapeXml(nextActionUrl)}" method="POST" timeout="6">
+          <Say>What else can I help with?</Say>
+        </Gather>
+        <Say>I did not hear anything. Thanks for calling. Goodbye.</Say>
+      </Response>
+    `);
   } catch (error) {
     console.error("Process route error:", error.message);
     res.send(twimlSay("I hit a small issue. Please ask again in a moment."));
