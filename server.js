@@ -30,8 +30,8 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const chatModel = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   generationConfig: {
-    maxOutputTokens: 180,
-    temperature: 0.4
+    maxOutputTokens: 1024,
+    temperature: 0.5
   }
 });
 const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
@@ -58,8 +58,18 @@ function toVoiceFriendlyResponse(text) {
   }
 
   const sentences = normalized.match(/[^.!?]+[.!?]?/g) || [];
-  const firstTwo = sentences.slice(0, 2).join(" ").trim();
-  return firstTwo || normalized.slice(0, 220);
+  const firstThree = sentences.slice(0, 3).join(" ").trim();
+  return firstThree || normalized;
+}
+
+function looksIncompleteResponse(text) {
+  const value = String(text || "").trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+
+  const danglingEndings = [" a", " an", " the", " or", " and", " to", " of", " for"];
+  return value.length < 20 || danglingEndings.some((end) => value.endsWith(end));
 }
 
 function twimlSay(message) {
@@ -199,15 +209,25 @@ async function getAIResponse(query, options = {}) {
     "Use the provided context if it is relevant and helpful.",
     "If the context is missing or unrelated, answer from general knowledge.",
     "For real-time questions (like current weather), answer with a brief best-effort response and mention it may change.",
+    "Always return complete, natural sentences. Do not end mid-phrase.",
     "",
     `Question: ${cleanedQuery}`,
     `Context: ${context || "No context available"}`,
     "",
-    "Return at most 2 short conversational sentences."
+    "Return a clear conversational answer suitable for voice."
   ].join("\n");
 
   const result = await chatModel.generateContent(prompt, options);
-  const rawText = result?.response?.text?.() || "";
+  let rawText = result?.response?.text?.() || "";
+
+  if (looksIncompleteResponse(rawText)) {
+    const repairPrompt = [
+      "Rewrite this as a complete, natural voice response in 1-2 sentences.",
+      `Original: ${rawText || cleanedQuery}`
+    ].join("\n");
+    const repairResult = await chatModel.generateContent(repairPrompt, options);
+    rawText = repairResult?.response?.text?.() || rawText;
+  }
 
   return toVoiceFriendlyResponse(rawText);
 }
@@ -356,7 +376,7 @@ app.post("/api/twilio/process", async (req, res) => {
 
     let aiResponse = "Sorry, I couldn't process your request. Please try again.";
     try {
-      const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 8000;
+      const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 15000;
       const result = await getAIResponseWithTimeout(userInput, timeoutMs);
       if (result) {
         aiResponse = result;
@@ -380,7 +400,7 @@ app.post("/api/twilio/process", async (req, res) => {
     res.send(`
       <Response>
         <Say>${escapeXml(aiResponse)}</Say>
-        <Gather input="speech" action="${escapeXml(nextActionUrl)}" method="POST" timeout="6">
+        <Gather input="speech" action="${escapeXml(nextActionUrl)}" method="POST" timeout="10" speechTimeout="auto">
           <Say>What else can I help with?</Say>
         </Gather>
         <Say>I did not hear anything. Thanks for calling. Goodbye.</Say>
