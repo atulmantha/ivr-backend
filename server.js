@@ -27,7 +27,13 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !GEMINI_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const chatModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const chatModel = genAI.getGenerativeModel({
+  model: "gemini-2.5-flash",
+  generationConfig: {
+    maxOutputTokens: 100,
+    temperature: 0.4
+  }
+});
 const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
 
 const requestedPort = Number(PORT) || 3000;
@@ -56,6 +62,18 @@ function toVoiceFriendlyResponse(text) {
   return firstTwo || normalized.slice(0, 220);
 }
 
+function withFollowUp(text) {
+  const base = toVoiceFriendlyResponse(text);
+  const cleaned = base.replace(/[.!?]+$/g, "").trim();
+  const sentences = cleaned.match(/[^.!?]+[.!?]?/g) || [];
+
+  if (sentences.length >= 2) {
+    return toVoiceFriendlyResponse(cleaned);
+  }
+
+  return `${cleaned}. What else can I help with?`;
+}
+
 function twimlSay(message) {
   return `
     <Response>
@@ -75,6 +93,30 @@ function getProcessActionUrl(req, callId) {
     url.searchParams.set("call_id", callId);
   }
   return url.toString();
+}
+
+function shouldUseRag(query) {
+  const text = String(query || "").toLowerCase();
+  const defaultKeywords = [
+    "office",
+    "hours",
+    "support",
+    "policy",
+    "billing",
+    "refund",
+    "account",
+    "password",
+    "service",
+    "product",
+    "plan"
+  ];
+  const extraKeywords = String(process.env.RAG_KEYWORDS || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+
+  const keywords = [...new Set([...defaultKeywords, ...extraKeywords])];
+  return keywords.some((keyword) => text.includes(keyword));
 }
 
 async function generateEmbedding(text) {
@@ -116,11 +158,11 @@ async function searchSimilar(queryEmbedding) {
 
   if (error) {
     if (error.code === "PGRST202") {
-      throw new Error(
-        "Supabase RPC 'match_knowledge' not found. Create it with ORDER BY embedding <-> query_embedding LIMIT 3."
-      );
+      console.warn("Supabase RPC 'match_knowledge' not found. Continuing without RAG context.");
+      return [];
     }
-    throw new Error(`Vector search failed: ${error.message}`);
+    console.warn(`Vector search failed. Continuing without RAG context: ${error.message}`);
+    return [];
   }
 
   return (data || [])
@@ -129,32 +171,58 @@ async function searchSimilar(queryEmbedding) {
     .slice(0, 3);
 }
 
+async function getContextForQuery(query) {
+  if (!shouldUseRag(query)) {
+    return [];
+  }
+
+  const timeoutMs = Number(process.env.RAG_CONTEXT_TIMEOUT_MS) || 2500;
+  const ragPromise = (async () => {
+    const embedding = await generateEmbedding(query);
+    return searchSimilar(embedding);
+  })();
+
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => resolve([]), timeoutMs);
+  });
+
+  return Promise.race([ragPromise, timeoutPromise]);
+}
+
 async function getAIResponse(query, options = {}) {
   const cleanedQuery = String(query || "").trim();
   if (!cleanedQuery) {
     return "I did not catch that. Please tell me your issue again.";
   }
 
-  const embedding = await generateEmbedding(cleanedQuery);
-  const contextChunks = await searchSimilar(embedding);
+  let contextChunks = [];
+  try {
+    contextChunks = await getContextForQuery(cleanedQuery);
+  } catch (error) {
+    console.warn(`Embedding/search unavailable, using general response only: ${error.message}`);
+  }
+
   const context = contextChunks.length > 0
     ? contextChunks.join("\n\n")
     : "No relevant context found.";
 
   const prompt = [
-    "Answer the question clearly in a short conversational voice response.",
-    "If no useful context is found, answer normally.",
+    "You are a voice assistant.",
+    "Use the provided context if it is relevant and helpful.",
+    "If the context is missing or unrelated, answer from general knowledge.",
+    "For real-time questions (like current weather), answer with a brief best-effort response and mention it may change.",
     "",
     `Question: ${cleanedQuery}`,
     `Context: ${context || "No context available"}`,
     "",
-    "Keep it to no more than 2 sentences."
+    "Return at most 2 short conversational sentences.",
+    "End with: What else can I help with?"
   ].join("\n");
 
   const result = await chatModel.generateContent(prompt, options);
   const rawText = result?.response?.text?.() || "";
 
-  return toVoiceFriendlyResponse(rawText);
+  return withFollowUp(rawText);
 }
 
 app.post("/api/twilio/voice", async (req, res) => {
