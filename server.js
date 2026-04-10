@@ -87,6 +87,47 @@ function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function buildPhoneVariants(rawPhone) {
+  const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
+  if (!digitsOnly) return [rawPhone].filter(Boolean);
+
+  const lastTen = digitsOnly.slice(-10);
+  const variants = new Set([rawPhone, digitsOnly, `+${digitsOnly}`]);
+
+  if (digitsOnly.length === 10) {
+    variants.add(`1${digitsOnly}`);
+    variants.add(`+1${digitsOnly}`);
+  }
+  if (digitsOnly.length > 10) {
+    variants.add(lastTen);
+    variants.add(`+1${lastTen}`);
+    variants.add(`1${lastTen}`);
+  }
+
+  return Array.from(variants).filter(Boolean);
+}
+
+async function lookupCustomerByPhone(rawPhone) {
+  if (!rawPhone) return null;
+
+  const variants = buildPhoneVariants(rawPhone);
+  if (variants.length === 0) return null;
+
+  const { data, error } = await supabase
+    .from("customers")
+    .select("*")
+    .in("phone", variants)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.warn("Customer phone lookup failed:", error.message);
+    return null;
+  }
+
+  return data || null;
+}
+
 function getProcessActionUrl(req, callId) {
   const base = (APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
   const url = new URL(`${base}/api/twilio/process`);
@@ -244,7 +285,17 @@ app.post("/api/twilio/voice", async (req, res) => {
     const processActionUrl = getProcessActionUrl(req, callId);
     const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
 
-    const { error } = await supabase.from("calls").insert({ id: callId, customer_phone: callerPhone });
+    let customer = null;
+    if (callerPhone) {
+      customer = await lookupCustomerByPhone(callerPhone);
+    }
+
+    const { error } = await supabase.from("calls").insert({
+      id: callId,
+      customer_phone: customer?.phone || callerPhone,
+      customer_name: customer?.name || null,
+      tier: customer?.tier || null
+    });
     if (error) {
       console.error("Failed to store call:", error.message);
     }
@@ -294,7 +345,7 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
     } else if (email) {
       query = query.eq("email", email);
     } else {
-      query = query.eq("phone", phone);
+      query = query.in("phone", buildPhoneVariants(phone));
     }
 
     const { data, error } = await query.maybeSingle();
