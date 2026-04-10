@@ -1,7 +1,7 @@
 const express = require("express");
 const { randomUUID } = require("crypto");
 const multer = require("multer");
-const pdfParse = require("pdf-parse");
+const pdfParse = require("pdf-parse/lib/pdf-parse.js");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
