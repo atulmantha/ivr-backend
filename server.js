@@ -297,7 +297,11 @@ app.post("/api/twilio/voice", async (req, res) => {
       tier: customer?.tier || null
     });
     if (error) {
-      console.error("Failed to store call:", error.message);
+      console.error("Failed to store enriched call, retrying with minimal payload:", error.message);
+      const { error: fallbackError } = await supabase.from("calls").insert({ id: callId });
+      if (fallbackError) {
+        console.error("Failed to store call (fallback):", fallbackError.message);
+      }
     }
     const { error: welcomeInsertError } = await supabase.from("messages").insert({
       call_id: callId,
