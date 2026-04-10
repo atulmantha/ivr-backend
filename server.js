@@ -1,10 +1,16 @@
 const express = require("express");
 const { randomUUID } = require("crypto");
+const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
 
 const app = express();
+const corsOrigin = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean)
+  : true;
+
+app.use(cors({ origin: corsOrigin }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -266,6 +272,54 @@ app.post("/api/twilio/voice", async (req, res) => {
 
 app.get("/", (req, res) => {
   res.send("Server is running 🚀");
+});
+
+async function fetchCustomerDetails(req, res, overrides = {}) {
+  const id = String(overrides.id ?? req.query.id ?? "").trim();
+  const email = String(overrides.email ?? req.query.email ?? "").trim();
+  const phone = String(overrides.phone ?? req.query.phone ?? "").trim();
+
+  if (!id && !email && !phone) {
+    return res.status(400).json({
+      error: "Provide at least one query parameter: id, email, or phone."
+    });
+  }
+
+  try {
+    let query = supabase.from("customers").select("*").limit(1);
+
+    if (id) {
+      query = query.eq("id", id);
+    } else if (email) {
+      query = query.eq("email", email);
+    } else {
+      query = query.eq("phone", phone);
+    }
+
+    const { data, error } = await query.maybeSingle();
+
+    if (error) {
+      console.error("Failed to fetch customer details:", error.message);
+      return res.status(500).json({ error: "Failed to fetch customer details." });
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: "Customer not found." });
+    }
+
+    return res.json({ customer: data });
+  } catch (error) {
+    console.error("customer-details route error:", error.message);
+    return res.status(500).json({ error: "Unexpected error while loading customer details." });
+  }
+}
+
+app.get("/api/customer-details", async (req, res) => {
+  return fetchCustomerDetails(req, res);
+});
+
+app.get("/api/customers/:id", async (req, res) => {
+  return fetchCustomerDetails(req, res, { id: req.params.id });
 });
 
 app.post("/api/twilio/process", async (req, res) => {
