@@ -242,8 +242,9 @@ app.post("/api/twilio/voice", async (req, res) => {
     const welcomeMessage = "Welcome to AI support.";
     const callId = randomUUID();
     const processActionUrl = getProcessActionUrl(req, callId);
+    const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
 
-    const { error } = await supabase.from("calls").insert({ id: callId });
+    const { error } = await supabase.from("calls").insert({ id: callId, customer_phone: callerPhone });
     if (error) {
       console.error("Failed to store call:", error.message);
     }
