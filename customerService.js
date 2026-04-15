@@ -1,4 +1,6 @@
 const { supabase } = require('./supabaseAdmin');
+const customerCache = new Map();
+const CUSTOMER_CACHE_TTL_MS = Number(process.env.CUSTOMER_CACHE_TTL_MS) || 5 * 60 * 1000;
 
 function normalizePhone(phone) {
   return String(phone || '').trim();
@@ -31,9 +33,40 @@ function buildPhoneVariants(phone) {
   return Array.from(variants);
 }
 
+function getCachedCustomer(phoneVariants) {
+  const now = Date.now();
+
+  for (const variant of phoneVariants) {
+    const cached = customerCache.get(variant);
+    if (!cached) continue;
+
+    if (cached.expiresAt <= now) {
+      customerCache.delete(variant);
+      continue;
+    }
+
+    return cached.customer;
+  }
+
+  return null;
+}
+
+function cacheCustomer(phoneVariants, customer) {
+  const expiresAt = Date.now() + CUSTOMER_CACHE_TTL_MS;
+
+  for (const variant of phoneVariants) {
+    customerCache.set(variant, { customer, expiresAt });
+  }
+}
+
 async function getCustomerByPhone(phone) {
   const phoneVariants = buildPhoneVariants(phone);
   if (phoneVariants.length === 0) return null;
+
+  const cachedCustomer = getCachedCustomer(phoneVariants);
+  if (cachedCustomer) {
+    return cachedCustomer;
+  }
 
   const lastTen = phoneVariants
     .map((value) => value.replace(/\D/g, ''))
@@ -56,7 +89,12 @@ async function getCustomerByPhone(phone) {
     throw new Error(`Failed to fetch customer: ${error.message}`);
   }
 
-  return data?.[0] || null;
+  const customer = data?.[0] || null;
+  if (customer) {
+    cacheCustomer(phoneVariants, customer);
+  }
+
+  return customer;
 }
 
 async function getCustomerById(customerId) {
@@ -110,6 +148,13 @@ async function incrementCustomerCalls(customerId, currentTotalCalls) {
 
   if (error) {
     throw new Error(`Failed to increment customer calls: ${error.message}`);
+  }
+
+  // Clear stale cached rows after mutation.
+  for (const [key, value] of customerCache.entries()) {
+    if (value.customer?.id === customerId) {
+      customerCache.delete(key);
+    }
   }
 }
 
