@@ -51,8 +51,8 @@ function makeConciseReply(text, options = {}) {
 
 async function generateGeminiReply(prompt, options = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-  const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || 2000;
+  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
+  const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || 5000;
 
   if (!apiKey) {
     return 'I can help you with your request. Please tell me what you need.';
