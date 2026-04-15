@@ -10,8 +10,9 @@ function buildGeminiPrompt({ personalization, userInput }) {
 }
 
 function makeConciseReply(text, options = {}) {
-  const maxSentences = Number(options.maxSentences) || 2;
-  const maxChars = Number(options.maxChars) || 180;
+  const maxSentences = Number(options.maxSentences) || 1;
+  const maxChars = Number(options.maxChars) || 110;
+  const maxWords = Number(options.maxWords) || 20;
 
   const normalized = String(text || '')
     .replace(/\s+/g, ' ')
@@ -23,6 +24,12 @@ function makeConciseReply(text, options = {}) {
 
   const sentences = normalized.match(/[^.!?]+[.!?]?/g) || [normalized];
   let concise = sentences.slice(0, maxSentences).join(' ').trim();
+
+  const words = concise.split(/\s+/).filter(Boolean);
+  if (words.length > maxWords) {
+    concise = words.slice(0, maxWords).join(' ').replace(/[,.!?;:\s]+$/, '');
+    concise = `${concise}.`;
+  }
 
   if (concise.length > maxChars) {
     concise = concise.slice(0, maxChars).trim();
@@ -45,7 +52,7 @@ function makeConciseReply(text, options = {}) {
 async function generateGeminiReply(prompt, options = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-  const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || 3500;
+  const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || 2000;
 
   if (!apiKey) {
     return 'I can help you with your request. Please tell me what you need.';
@@ -88,6 +95,7 @@ async function generateGeminiReply(prompt, options = {}) {
     return makeConciseReply(text || 'I can help with that. Could you share a bit more detail?', {
       maxSentences: options.maxSentences,
       maxChars: options.maxChars,
+      maxWords: options.maxWords,
     });
   } catch (error) {
     if (error?.name === 'AbortError') {
