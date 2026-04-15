@@ -33,7 +33,7 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const chatModel = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   generationConfig: {
-    maxOutputTokens: 1024,
+    maxOutputTokens: 200,
     temperature: 0.5
   }
 });
@@ -65,15 +65,6 @@ function toVoiceFriendlyResponse(text) {
   return firstThree || normalized;
 }
 
-function looksIncompleteResponse(text) {
-  const value = String(text || "").trim().toLowerCase();
-  if (!value) {
-    return true;
-  }
-
-  const danglingEndings = [" a", " an", " the", " or", " and", " to", " of", " for"];
-  return value.length < 20 || danglingEndings.some((end) => value.endsWith(end));
-}
 
 function twimlSay(message) {
   return `
@@ -218,7 +209,7 @@ async function getContextForQuery(query) {
     return [];
   }
 
-  const timeoutMs = Number(process.env.RAG_CONTEXT_TIMEOUT_MS) || 2500;
+  const timeoutMs = Number(process.env.RAG_CONTEXT_TIMEOUT_MS) || 1000;
   const ragPromise = (async () => {
     const embedding = await generateEmbedding(query);
     return searchSimilar(embedding);
@@ -249,31 +240,18 @@ async function getAIResponse(query, options = {}) {
     : "No relevant context found.";
 
   const prompt = [
-    "You are a voice assistant.",
-    "Use the provided context if it is relevant and helpful.",
-    "If the context is missing or unrelated, answer from general knowledge.",
-    "For real-time questions (like current weather), answer with a brief best-effort response and mention it may change.",
-    "Always return complete, natural sentences. Do not end mid-phrase.",
+    "You are a voice assistant. Reply in exactly 1-2 complete sentences. Never end mid-phrase or mid-word.",
+    "Use the provided context if it is relevant. Otherwise, answer from general knowledge.",
+    "For real-time questions, give a brief best-effort answer and note it may change.",
     "",
     `Question: ${cleanedQuery}`,
-    `Context: ${context || "No context available"}`,
-    "",
-    "Return a clear conversational answer suitable for voice."
+    `Context: ${context || "No context available"}`
   ].join("\n");
 
   const result = await chatModel.generateContent(prompt, options);
-  let rawText = result?.response?.text?.() || "";
+  const rawText = result?.response?.text?.() || "";
 
-  if (looksIncompleteResponse(rawText)) {
-    const repairPrompt = [
-      "Rewrite this as a complete, natural voice response in 1-2 sentences.",
-      `Original: ${rawText || cleanedQuery}`
-    ].join("\n");
-    const repairResult = await chatModel.generateContent(repairPrompt, options);
-    rawText = repairResult?.response?.text?.() || rawText;
-  }
-
-  return toVoiceFriendlyResponse(rawText);
+  return toVoiceFriendlyResponse(rawText) || "I could not find that right now. Please try again.";
 }
 
 app.post("/api/twilio/voice", async (req, res) => {
@@ -290,24 +268,25 @@ app.post("/api/twilio/voice", async (req, res) => {
       customer = await lookupCustomerByPhone(callerPhone);
     }
 
-    const { error } = await supabase.from("calls").insert({
-      id: callId,
-      customer_phone: customer?.phone || callerPhone,
-      customer_name: customer?.name || null,
-      tier: customer?.tier || null
-    });
+    const [{ error }, { error: welcomeInsertError }] = await Promise.all([
+      supabase.from("calls").insert({
+        id: callId,
+        customer_phone: customer?.phone || callerPhone,
+        customer_name: customer?.name || null,
+        tier: customer?.tier || null
+      }),
+      supabase.from("messages").insert({
+        call_id: callId,
+        role: "assistant",
+        content: welcomeMessage
+      })
+    ]);
     if (error) {
       console.error("Failed to store enriched call, retrying with minimal payload:", error.message);
-      const { error: fallbackError } = await supabase.from("calls").insert({ id: callId });
-      if (fallbackError) {
-        console.error("Failed to store call (fallback):", fallbackError.message);
-      }
+      supabase.from("calls").insert({ id: callId }).then(({ error: fallbackError }) => {
+        if (fallbackError) console.error("Failed to store call (fallback):", fallbackError.message);
+      });
     }
-    const { error: welcomeInsertError } = await supabase.from("messages").insert({
-      call_id: callId,
-      role: "assistant",
-      content: welcomeMessage
-    });
     if (welcomeInsertError) {
       console.error("Failed to store welcome message:", welcomeInsertError.message);
     }
@@ -398,38 +377,19 @@ app.post("/api/twilio/process", async (req, res) => {
       }
     }
 
-    const userMessage = {
-      call_id: callId,
-      role: "user",
-      content: userInput
-    };
+    const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 7000;
 
-    const { error: userInsertError } = await supabase.from("messages").insert(userMessage);
-    if (userInsertError) {
-      console.error("Failed to store user message:", userInsertError.message);
-    }
+    const [, aiResponse] = await Promise.all([
+      supabase.from("messages").insert({ call_id: callId, role: "user", content: userInput })
+        .then(({ error }) => { if (error) console.error("Failed to store user message:", error.message); }),
+      getAIResponseWithTimeout(userInput, timeoutMs).catch((error) => {
+        console.error("AI error:", error);
+        return "Sorry, I couldn't process your request. Please try again.";
+      })
+    ]);
 
-    let aiResponse = "Sorry, I couldn't process your request. Please try again.";
-    try {
-      const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 15000;
-      const result = await getAIResponseWithTimeout(userInput, timeoutMs);
-      if (result) {
-        aiResponse = result;
-      }
-    } catch (error) {
-      console.error("AI error:", error);
-    }
-
-    const assistantMessage = {
-      call_id: callId,
-      role: "assistant",
-      content: aiResponse
-    };
-
-    const { error: assistantInsertError } = await supabase.from("messages").insert(assistantMessage);
-    if (assistantInsertError) {
-      console.error("Failed to store assistant message:", assistantInsertError.message);
-    }
+    supabase.from("messages").insert({ call_id: callId, role: "assistant", content: aiResponse })
+      .then(({ error }) => { if (error) console.error("Failed to store assistant message:", error.message); });
 
     const nextActionUrl = getProcessActionUrl(req, callId);
     res.send(`
