@@ -1,117 +1,481 @@
-const express = require('express');
-const {
-  getCustomerByPhone,
-  getCustomerById,
-  getCustomerByEmail,
-  incrementCustomerCalls,
-  getPersonalization,
-} = require('./lib/backend/customerService');
-const { buildGeminiPrompt, generateGeminiReply } = require('./lib/backend/geminiService');
-const { insertCallRecord } = require('./lib/backend/callService');
-const { buildVoiceTwiML } = require('./lib/backend/twiml');
+const express = require("express");
+const { randomUUID } = require("crypto");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+require("dotenv").config();
 
 const app = express();
-const port = process.env.PORT || 3000;
+const corsOrigin = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean)
+  : true;
 
-app.use(express.urlencoded({ extended: false }));
+app.use(cors({ origin: corsOrigin }));
+app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-async function handleVoiceWebhook(req, res) {
-  const fromPhone = req.body?.From || '';
-  const callSid = req.body?.CallSid || null;
-  const userInput = req.body?.SpeechResult || req.body?.Body || 'Hello';
+const {
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  GEMINI_API_KEY,
+  APP_BASE_URL,
+  PORT
+} = process.env;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !GEMINI_API_KEY) {
+  throw new Error(
+    "Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or GEMINI_API_KEY. Update .env using .env.example."
+  );
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const chatModel = genAI.getGenerativeModel({
+  model: "gemini-2.5-flash",
+  generationConfig: {
+    maxOutputTokens: 1024,
+    temperature: 0.5
+  }
+});
+const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+
+const requestedPort = Number(PORT) || 3000;
+const hasExplicitPort = Boolean(PORT);
+
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function toVoiceFriendlyResponse(text) {
+  const normalized = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return "I could not find that right now. Please try again.";
+  }
+
+  const sentences = normalized.match(/[^.!?]+[.!?]?/g) || [];
+  const firstThree = sentences.slice(0, 3).join(" ").trim();
+  return firstThree || normalized;
+}
+
+function looksIncompleteResponse(text) {
+  const value = String(text || "").trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+
+  const danglingEndings = [" a", " an", " the", " or", " and", " to", " of", " for"];
+  return value.length < 20 || danglingEndings.some((end) => value.endsWith(end));
+}
+
+function twimlSay(message) {
+  return `
+    <Response>
+      <Say>${escapeXml(message)}</Say>
+    </Response>
+  `;
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function buildPhoneVariants(rawPhone) {
+  const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
+  if (!digitsOnly) return [rawPhone].filter(Boolean);
+
+  const lastTen = digitsOnly.slice(-10);
+  const variants = new Set([rawPhone, digitsOnly, `+${digitsOnly}`]);
+
+  if (digitsOnly.length === 10) {
+    variants.add(`1${digitsOnly}`);
+    variants.add(`+1${digitsOnly}`);
+  }
+  if (digitsOnly.length > 10) {
+    variants.add(lastTen);
+    variants.add(`+1${lastTen}`);
+    variants.add(`1${lastTen}`);
+  }
+
+  return Array.from(variants).filter(Boolean);
+}
+
+async function lookupCustomerByPhone(rawPhone) {
+  if (!rawPhone) return null;
+
+  const variants = buildPhoneVariants(rawPhone);
+  if (variants.length === 0) return null;
+
+  const { data, error } = await supabase
+    .from("customers")
+    .select("*")
+    .in("phone", variants)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.warn("Customer phone lookup failed:", error.message);
+    return null;
+  }
+
+  return data || null;
+}
+
+function getProcessActionUrl(req, callId) {
+  const base = (APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
+  const url = new URL(`${base}/api/twilio/process`);
+  if (callId) {
+    url.searchParams.set("call_id", callId);
+  }
+  return url.toString();
+}
+
+function shouldUseRag(query) {
+  const text = String(query || "").toLowerCase();
+  const defaultKeywords = [
+    "office",
+    "hours",
+    "support",
+    "policy",
+    "billing",
+    "refund",
+    "account",
+    "password",
+    "service",
+    "product",
+    "plan"
+  ];
+  const extraKeywords = String(process.env.RAG_KEYWORDS || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+
+  const keywords = [...new Set([...defaultKeywords, ...extraKeywords])];
+  return keywords.some((keyword) => text.includes(keyword));
+}
+
+async function generateEmbedding(text) {
+  const input = String(text || "").trim();
+  if (!input) {
+    return null;
+  }
+
+  const result = await embeddingModel.embedContent(input);
+  const embedding = result?.embedding?.values;
+
+  if (!Array.isArray(embedding) || embedding.length === 0) {
+    throw new Error("Failed to generate embedding from Gemini.");
+  }
+
+  return embedding;
+}
+
+async function getAIResponseWithTimeout(query, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const customer = await getCustomerByPhone(fromPhone);
-
-    const personalization = getPersonalization(customer, fromPhone);
-    const prompt = buildGeminiPrompt({ personalization, userInput });
-
-    let aiReply = 'How can I help you today?';
-    try {
-      aiReply = await generateGeminiReply(prompt, {
-        maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 64,
-        maxSentences: Number(process.env.GEMINI_MAX_SENTENCES) || 2,
-        maxChars: Number(process.env.GEMINI_MAX_CHARS) || 180,
-      });
-    } catch (aiError) {
-      console.error('Gemini error:', aiError.message);
-    }
-
-    const twiml = buildVoiceTwiML(personalization.greeting, aiReply);
-    res.type('text/xml').status(200).send(twiml);
-
-    // Keep Twilio latency low by moving bookkeeping out of the response path.
-    Promise.allSettled([
-      customer?.id ? incrementCustomerCalls(customer.id, customer.total_calls) : Promise.resolve(),
-      insertCallRecord({
-        existingCallData: {
-          call_sid: callSid,
-        },
-        customerName: personalization.customerName,
-        customerPhone: personalization.customerPhone,
-        tier: personalization.tier,
-      }),
-    ]).then((results) => {
-      results.forEach((result, index) => {
-        if (result.status === 'rejected') {
-          const label = index === 0 ? 'Customer call count update' : 'Call insert';
-          console.error(`${label} error:`, result.reason?.message || result.reason);
-        }
-      });
-    });
-  } catch (error) {
-    console.error('Voice webhook error:', error.message);
-
-    const fallbackTwiML = buildVoiceTwiML(
-      'Hello. Thank you for calling us.',
-      'We are facing a temporary issue, but your call is important to us.'
-    );
-
-    res.type('text/xml').status(200).send(fallbackTwiML);
+    return await getAIResponse(query, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutHandle);
   }
 }
 
-app.post('/api/twilio/voice', handleVoiceWebhook);
-app.post('/process', handleVoiceWebhook);
+async function searchSimilar(queryEmbedding) {
+  if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
+    return [];
+  }
 
-app.get('/api/customer-details', async (req, res) => {
-  const phone = String(req.query?.phone || '').trim();
-  const id = String(req.query?.id || '').trim();
-  const email = String(req.query?.email || '').trim();
+  const { data, error } = await supabase.rpc("match_knowledge", {
+    query_embedding: queryEmbedding,
+    match_count: 3
+  });
 
-  if (!phone && !id && !email) {
-    return res
-      .status(400)
-      .json({ error: 'Provide at least one query parameter: id, email, or phone.' });
+  if (error) {
+    if (error.code === "PGRST202") {
+      console.warn("Supabase RPC 'match_knowledge' not found. Continuing without RAG context.");
+      return [];
+    }
+    console.warn(`Vector search failed. Continuing without RAG context: ${error.message}`);
+    return [];
+  }
+
+  return (data || [])
+    .map((row) => row.content)
+    .filter(Boolean)
+    .slice(0, 3);
+}
+
+async function getContextForQuery(query) {
+  if (!shouldUseRag(query)) {
+    return [];
+  }
+
+  const timeoutMs = Number(process.env.RAG_CONTEXT_TIMEOUT_MS) || 2500;
+  const ragPromise = (async () => {
+    const embedding = await generateEmbedding(query);
+    return searchSimilar(embedding);
+  })();
+
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => resolve([]), timeoutMs);
+  });
+
+  return Promise.race([ragPromise, timeoutPromise]);
+}
+
+async function getAIResponse(query, options = {}) {
+  const cleanedQuery = String(query || "").trim();
+  if (!cleanedQuery) {
+    return "I did not catch that. Please tell me your issue again.";
+  }
+
+  let contextChunks = [];
+  try {
+    contextChunks = await getContextForQuery(cleanedQuery);
+  } catch (error) {
+    console.warn(`Embedding/search unavailable, using general response only: ${error.message}`);
+  }
+
+  const context = contextChunks.length > 0
+    ? contextChunks.join("\n\n")
+    : "No relevant context found.";
+
+  const prompt = [
+    "You are a voice assistant.",
+    "Use the provided context if it is relevant and helpful.",
+    "If the context is missing or unrelated, answer from general knowledge.",
+    "For real-time questions (like current weather), answer with a brief best-effort response and mention it may change.",
+    "Always return complete, natural sentences. Do not end mid-phrase.",
+    "",
+    `Question: ${cleanedQuery}`,
+    `Context: ${context || "No context available"}`,
+    "",
+    "Return a clear conversational answer suitable for voice."
+  ].join("\n");
+
+  const result = await chatModel.generateContent(prompt, options);
+  let rawText = result?.response?.text?.() || "";
+
+  if (looksIncompleteResponse(rawText)) {
+    const repairPrompt = [
+      "Rewrite this as a complete, natural voice response in 1-2 sentences.",
+      `Original: ${rawText || cleanedQuery}`
+    ].join("\n");
+    const repairResult = await chatModel.generateContent(repairPrompt, options);
+    rawText = repairResult?.response?.text?.() || rawText;
+  }
+
+  return toVoiceFriendlyResponse(rawText);
+}
+
+app.post("/api/twilio/voice", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  try {
+    const welcomeMessage = "Welcome to AI support.";
+    const callId = randomUUID();
+    const processActionUrl = getProcessActionUrl(req, callId);
+    const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
+
+    let customer = null;
+    if (callerPhone) {
+      customer = await lookupCustomerByPhone(callerPhone);
+    }
+
+    const { error } = await supabase.from("calls").insert({
+      id: callId,
+      customer_phone: customer?.phone || callerPhone,
+      customer_name: customer?.name || null,
+      tier: customer?.tier || null
+    });
+    if (error) {
+      console.error("Failed to store enriched call, retrying with minimal payload:", error.message);
+      const { error: fallbackError } = await supabase.from("calls").insert({ id: callId });
+      if (fallbackError) {
+        console.error("Failed to store call (fallback):", fallbackError.message);
+      }
+    }
+    const { error: welcomeInsertError } = await supabase.from("messages").insert({
+      call_id: callId,
+      role: "assistant",
+      content: welcomeMessage
+    });
+    if (welcomeInsertError) {
+      console.error("Failed to store welcome message:", welcomeInsertError.message);
+    }
+
+    res.send(`
+      <Response>
+        <Say>${escapeXml(welcomeMessage)}</Say>
+        <Gather input="speech" action="${escapeXml(processActionUrl)}" method="POST">
+          <Say>Please tell me your issue.</Say>
+        </Gather>
+      </Response>
+    `);
+  } catch (error) {
+    console.error("Voice route error:", error.message);
+    res.send(twimlSay("We are having trouble right now. Please try again shortly."));
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send("Server is running 🚀");
+});
+
+async function fetchCustomerDetails(req, res, overrides = {}) {
+  const id = String(overrides.id ?? req.query.id ?? "").trim();
+  const email = String(overrides.email ?? req.query.email ?? "").trim();
+  const phone = String(overrides.phone ?? req.query.phone ?? "").trim();
+
+  if (!id && !email && !phone) {
+    return res.status(400).json({
+      error: "Provide at least one query parameter: id, email, or phone."
+    });
   }
 
   try {
-    let customer = null;
+    let query = supabase.from("customers").select("*").limit(1);
 
-    if (phone) {
-      customer = await getCustomerByPhone(phone);
-    } else if (id) {
-      customer = await getCustomerById(id);
+    if (id) {
+      query = query.eq("id", id);
     } else if (email) {
-      customer = await getCustomerByEmail(email);
+      query = query.eq("email", email);
+    } else {
+      query = query.in("phone", buildPhoneVariants(phone));
     }
 
-    if (!customer) {
-      return res.status(404).json({ error: 'Customer not found.' });
+    const { data, error } = await query.maybeSingle();
+
+    if (error) {
+      console.error("Failed to fetch customer details:", error.message);
+      return res.status(500).json({ error: "Failed to fetch customer details." });
     }
 
-    return res.status(200).json({ customer });
+    if (!data) {
+      return res.status(404).json({ error: "Customer not found." });
+    }
+
+    return res.json({ customer: data });
   } catch (error) {
-    console.error('Customer details route error:', error.message);
-    return res.status(500).json({ error: 'Failed to fetch customer details.' });
+    console.error("customer-details route error:", error.message);
+    return res.status(500).json({ error: "Unexpected error while loading customer details." });
+  }
+}
+
+app.get("/api/customer-details", async (req, res) => {
+  return fetchCustomerDetails(req, res);
+});
+
+app.get("/api/customers/:id", async (req, res) => {
+  return fetchCustomerDetails(req, res, { id: req.params.id });
+});
+
+app.post("/api/twilio/process", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  try {
+    console.log("🔥 /api/twilio/process hit");
+    console.log("Twilio body:", req.body);
+    console.log("Twilio query:", req.query);
+
+    const userInput = String(req.body.SpeechResult || "No speech detected").trim();
+    const incomingCallId = String(req.query.call_id || "").trim();
+    const callId = isUuid(incomingCallId) ? incomingCallId : randomUUID();
+
+    if (!isUuid(incomingCallId)) {
+      console.warn("Missing/invalid call_id query param. Generated fallback call_id.");
+      const { error: fallbackCallError } = await supabase.from("calls").insert({ id: callId });
+      if (fallbackCallError) {
+        console.error("Failed to create fallback call row:", fallbackCallError.message);
+      }
+    }
+
+    const userMessage = {
+      call_id: callId,
+      role: "user",
+      content: userInput
+    };
+
+    const { error: userInsertError } = await supabase.from("messages").insert(userMessage);
+    if (userInsertError) {
+      console.error("Failed to store user message:", userInsertError.message);
+    }
+
+    let aiResponse = "Sorry, I couldn't process your request. Please try again.";
+    try {
+      const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 15000;
+      const result = await getAIResponseWithTimeout(userInput, timeoutMs);
+      if (result) {
+        aiResponse = result;
+      }
+    } catch (error) {
+      console.error("AI error:", error);
+    }
+
+    const assistantMessage = {
+      call_id: callId,
+      role: "assistant",
+      content: aiResponse
+    };
+
+    const { error: assistantInsertError } = await supabase.from("messages").insert(assistantMessage);
+    if (assistantInsertError) {
+      console.error("Failed to store assistant message:", assistantInsertError.message);
+    }
+
+    const nextActionUrl = getProcessActionUrl(req, callId);
+    res.send(`
+      <Response>
+        <Say>${escapeXml(aiResponse)}</Say>
+        <Gather input="speech" action="${escapeXml(nextActionUrl)}" method="POST" timeout="10" speechTimeout="auto">
+          <Say>What else can I help with?</Say>
+        </Gather>
+        <Say>I did not hear anything. Thanks for calling. Goodbye.</Say>
+      </Response>
+    `);
+  } catch (error) {
+    console.error("Process route error:", error.message);
+    res.send(twimlSay("I hit a small issue. Please ask again in a moment."));
   }
 });
 
-app.get('/health', (_req, res) => {
-  res.status(200).json({ ok: true });
-});
+function startServer(port) {
+  const server = app.listen(port, () => console.log(`Server running on ${port}`));
 
-app.listen(port, () => {
-  console.log(`IVR backend listening on port ${port}`);
-});
+  server.on("error", (error) => {
+    if (error.code !== "EADDRINUSE") {
+      throw error;
+    }
+
+    if (hasExplicitPort) {
+      console.error(
+        `Port ${port} is already in use. Stop the other process or set a different PORT in .env.`
+      );
+      process.exit(1);
+    }
+
+    const nextPort = port + 1;
+    console.warn(`Port ${port} is busy. Retrying on ${nextPort}...`);
+    startServer(nextPort);
+  });
+}
+
+if (require.main === module) {
+  startServer(requestedPort);
+}
+
+module.exports = {
+  app,
+  startServer,
+  generateEmbedding,
+  searchSimilar,
+  getAIResponse
+};
