@@ -11,7 +11,6 @@ function buildVoiceTwiML(greeting, aiReply) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">${xmlEscape(greeting)}</Say>
-  <Pause length="1"/>
   <Say voice="alice">${xmlEscape(aiReply)}</Say>
 </Response>`;
 }
