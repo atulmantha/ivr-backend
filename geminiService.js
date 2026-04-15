@@ -2,9 +2,44 @@ function buildGeminiPrompt({ personalization, userInput }) {
   return [
     personalization.aiSystemContext,
     `Customer says: ${userInput}`,
-    'Reply in 1 or 2 short voice-friendly sentences.',
+    'Reply in 1 short, voice-friendly sentence when possible.',
+    'Use plain language and be direct.',
+    'Maximum 25 words.',
     'Do not use lists, markdown, or long explanations.',
   ].join('\n\n');
+}
+
+function makeConciseReply(text, options = {}) {
+  const maxSentences = Number(options.maxSentences) || 2;
+  const maxChars = Number(options.maxChars) || 180;
+
+  const normalized = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) {
+    return 'I can help with that.';
+  }
+
+  const sentences = normalized.match(/[^.!?]+[.!?]?/g) || [normalized];
+  let concise = sentences.slice(0, maxSentences).join(' ').trim();
+
+  if (concise.length > maxChars) {
+    concise = concise.slice(0, maxChars).trim();
+    const lastPunctuation = Math.max(
+      concise.lastIndexOf('.'),
+      concise.lastIndexOf('!'),
+      concise.lastIndexOf('?')
+    );
+
+    if (lastPunctuation > 20) {
+      concise = concise.slice(0, lastPunctuation + 1).trim();
+    } else {
+      concise = `${concise.replace(/[,.!?;:\s]+$/, '')}.`;
+    }
+  }
+
+  return concise;
 }
 
 async function generateGeminiReply(prompt, options = {}) {
@@ -30,7 +65,7 @@ async function generateGeminiReply(prompt, options = {}) {
         signal: controller.signal,
         body: JSON.stringify({
           generationConfig: {
-            maxOutputTokens: options.maxOutputTokens || 120,
+            maxOutputTokens: options.maxOutputTokens || 64,
             temperature: options.temperature ?? 0.3,
           },
           contents: [
@@ -50,7 +85,10 @@ async function generateGeminiReply(prompt, options = {}) {
     const data = await response.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
 
-    return text || 'I can help with that. Could you share a bit more detail?';
+    return makeConciseReply(text || 'I can help with that. Could you share a bit more detail?', {
+      maxSentences: options.maxSentences,
+      maxChars: options.maxChars,
+    });
   } catch (error) {
     if (error?.name === 'AbortError') {
       throw new Error(`Gemini API timed out after ${timeoutMs}ms`);
