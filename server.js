@@ -294,7 +294,7 @@ app.post("/api/twilio/voice", async (req, res) => {
     res.send(`
       <Response>
         <Say>${escapeXml(welcomeMessage)}</Say>
-        <Gather input="speech" action="${escapeXml(processActionUrl)}" method="POST">
+        <Gather input="speech" action="${escapeXml(processActionUrl)}" method="POST" timeout="3" speechTimeout="1">
           <Say>Please tell me your issue.</Say>
         </Gather>
       </Response>
@@ -371,10 +371,9 @@ app.post("/api/twilio/process", async (req, res) => {
 
     if (!isUuid(incomingCallId)) {
       console.warn("Missing/invalid call_id query param. Generated fallback call_id.");
-      const { error: fallbackCallError } = await supabase.from("calls").insert({ id: callId });
-      if (fallbackCallError) {
-        console.error("Failed to create fallback call row:", fallbackCallError.message);
-      }
+      supabase.from("calls").insert({ id: callId }).then(({ error }) => {
+        if (error) console.error("Failed to create fallback call row:", error.message);
+      });
     }
 
     const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 7000;
@@ -395,7 +394,7 @@ app.post("/api/twilio/process", async (req, res) => {
     res.send(`
       <Response>
         <Say>${escapeXml(aiResponse)}</Say>
-        <Gather input="speech" action="${escapeXml(nextActionUrl)}" method="POST" timeout="10" speechTimeout="auto">
+        <Gather input="speech" action="${escapeXml(nextActionUrl)}" method="POST" timeout="3" speechTimeout="1">
           <Say>What else can I help with?</Say>
         </Gather>
         <Say>I did not hear anything. Thanks for calling. Goodbye.</Say>
