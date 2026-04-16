@@ -303,18 +303,34 @@ app.post("/api/knowledge/upload", upload.single("file"), async (req, res) => {
 
   const source = req.file.originalname;
 
+  let chunks;
   try {
     const rawText = await extractText(req.file);
     if (!rawText.trim()) {
       return res.status(422).json({ error: "Could not extract text from file." });
     }
 
-    const chunks = chunkText(rawText);
+    chunks = chunkText(rawText);
     if (chunks.length === 0) {
       return res.status(422).json({ error: "File appears to be empty." });
     }
+  } catch (err) {
+    console.error("File parse error:", err.message);
+    return res.status(422).json({ error: "Failed to parse file content." });
+  }
 
-    // Embed and insert each chunk (sequentially to avoid rate limits)
+  // Respond immediately — embedding can take minutes for large files.
+  // Processing continues in the background.
+  res.json({
+    success:      true,
+    file:         source,
+    total_chunks: chunks.length,
+    inserted_chunks: chunks.length, // optimistic; errors logged below
+    status:       "processing",
+  });
+
+  // Background: embed and insert each chunk sequentially (avoid rate limits)
+  (async () => {
     let inserted = 0;
     for (const chunk of chunks) {
       try {
@@ -333,17 +349,8 @@ app.post("/api/knowledge/upload", upload.single("file"), async (req, res) => {
         console.error(`Embedding error (${source}):`, chunkErr.message);
       }
     }
-
-    return res.json({
-      success: true,
-      file:    source,
-      total_chunks:    chunks.length,
-      inserted_chunks: inserted,
-    });
-  } catch (err) {
-    console.error("File upload error:", err.message);
-    return res.status(500).json({ error: "Failed to process file." });
-  }
+    console.log(`[upload] ${source}: inserted ${inserted}/${chunks.length} chunks`);
+  })();
 });
 
 // Multer error handler
