@@ -2,7 +2,7 @@ services:
   - type: web
     name: ivr-backend
     runtime: node
-    buildCommand: npm install
+    buildCommand: NODE_OPTIONS=--max-old-space-size=512 npm install
     startCommand: node server.js
     envVars:
       # ── Required ──────────────────────────────────────────────────
@@ -38,5 +38,3 @@ services:
       # ── Optional ──────────────────────────────────────────────
       - key: CORS_ORIGIN
         sync: false
-      - key: PORT
-        value: "3000"
