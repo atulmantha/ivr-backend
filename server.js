@@ -142,17 +142,23 @@ async function lookupCustomerByPhone(rawPhone) {
 }
 
 // ── Conference TwiML builders ─────────────────────────────────
+// NOTE: call_id and role are passed as <Parameter> elements, NOT as URL query
+// params. Render's reverse proxy strips query params from WebSocket upgrades,
+// so we embed them in the TwiML and read them from the Twilio 'start' event.
 function customerConferenceTwiml(callId) {
-  const rawStreamUrl = `${WS_BASE_URL}/api/media-stream?call_id=${callId}&role=customer`;
-  console.log("[twiml] Customer stream URL:", rawStreamUrl);
-  const streamUrl  = escapeXml(rawStreamUrl);
-  const statusUrl  = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
-  const room       = `room-${callId}`;
+  const streamUrl = escapeXml(`${WS_BASE_URL}/api/media-stream`);
+  const statusUrl = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  const room      = `room-${callId}`;
+
+  console.log("[twiml] Customer stream URL:", `${WS_BASE_URL}/api/media-stream`);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
-    <Stream url="${streamUrl}" track="inbound_track"/>
+    <Stream url="${streamUrl}" track="inbound_track">
+      <Parameter name="call_id" value="${escapeXml(callId)}"/>
+      <Parameter name="role" value="customer"/>
+    </Stream>
   </Start>
   <Dial>
     <Conference beep="false"
@@ -166,13 +172,16 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const streamUrl = escapeXml(`${WS_BASE_URL}/api/media-stream?call_id=${callId}&role=agent`);
+  const streamUrl = escapeXml(`${WS_BASE_URL}/api/media-stream`);
   const room      = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
-    <Stream url="${streamUrl}" track="inbound_track"/>
+    <Stream url="${streamUrl}" track="inbound_track">
+      <Parameter name="call_id" value="${escapeXml(callId)}"/>
+      <Parameter name="role" value="agent"/>
+    </Stream>
   </Start>
   <Dial>
     <Conference beep="false" waitUrl="">
@@ -441,29 +450,59 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 wss.on("connection", (ws, req) => {
-  const url    = new URL(req.url, "http://localhost");
-  const callId = url.searchParams.get("call_id");
-  const role   = url.searchParams.get("role") || "customer";
+  const url          = new URL(req.url, "http://localhost");
+  const callIdFromUrl = url.searchParams.get("call_id");
+  const roleFromUrl   = url.searchParams.get("role");
 
-  if (!callId || !isUuid(callId)) {
-    console.error(`[ws] REJECTED: missing or invalid call_id="${callId}" — full URL: ${req.url}`);
-    ws.close();
+  // Local dev: query params survive → start immediately
+  if (callIdFromUrl && isUuid(callIdFromUrl)) {
+    console.log(`[ws] Connected (URL params): role=${roleFromUrl} callId=${callIdFromUrl}`);
+    startMediaStream(ws, callIdFromUrl, roleFromUrl || "customer");
     return;
   }
 
-  console.log(`[ws] Connected: role=${role} callId=${callId}`);
+  // Render strips query params from WebSocket upgrades.
+  // Read call_id + role from Twilio's 'start' event customParameters instead.
+  console.log(`[ws] No call_id in URL (Render proxy stripped params) — waiting for Twilio start event`);
 
+  const onStartEvent = (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.event !== "start") return;
+
+      const params = msg.start?.customParameters || {};
+      const callId = String(params.call_id || "").trim();
+      const role   = String(params.role    || "customer").trim();
+
+      ws.removeListener("message", onStartEvent);
+
+      if (!callId || !isUuid(callId)) {
+        console.error(`[ws] start event has no valid call_id. customParameters=${JSON.stringify(params)}`);
+        ws.close();
+        return;
+      }
+
+      console.log(`[ws] Resolved from start event: role=${role} callId=${callId}`);
+      startMediaStream(ws, callId, role);
+    } catch (err) {
+      console.error("[ws] Start event parse error:", err.message);
+    }
+  };
+
+  ws.on("message", onStartEvent);
+  ws.on("close", () => ws.removeListener("message", onStartEvent));
+});
+
+function startMediaStream(ws, callId, role) {
   handleMediaStream(ws, callId, role, supabase, async ({ transcript }) => {
     if (role !== "customer") return;
 
-    console.log(`[analysis] Transcript received: "${transcript.slice(0, 80)}..."`);
+    console.log(`[analysis] Transcript: "${transcript.slice(0, 80)}"`);
 
     try {
       const { data: callData } = await supabase
         .from("calls").select("tier").eq("id", callId).maybeSingle();
       const tier = callData?.tier || "Regular";
-
-      console.log(`[analysis] Running Gemini + embedding for callId=${callId} tier=${tier}`);
 
       const [analysisResult, embedding] = await Promise.all([
         analyzeCustomerSpeech(transcript, tier),
@@ -473,15 +512,13 @@ wss.on("connection", (ws, req) => {
         }),
       ]);
 
-      console.log(`[analysis] Result: emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
+      console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
 
-      const contextChunks = embedding
-        ? await searchKnowledge(supabase, embedding)
-        : [];
-      console.log(`[analysis] RAG chunks found: ${contextChunks.length}`);
+      const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
+      console.log(`[analysis] RAG chunks: ${contextChunks.length}`);
 
       const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier);
-      console.log(`[analysis] Suggested reply: "${suggestedReply.slice(0, 80)}..."`);
+      console.log(`[analysis] Reply: "${(suggestedReply || "").slice(0, 80)}"`);
 
       await Promise.all([
         supabase.from("analysis").insert({
@@ -503,11 +540,10 @@ wss.on("connection", (ws, req) => {
           }),
       ]);
     } catch (err) {
-      console.error("[analysis] Pipeline error:", err.message);
-      console.error("[analysis] Stack:", err.stack);
+      console.error("[analysis] Pipeline error:", err.message, err.stack);
     }
   });
-});
+}
 
 // ── Start server ──────────────────────────────────────────────
 function startServer(p) {
