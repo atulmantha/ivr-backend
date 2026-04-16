@@ -1,11 +1,33 @@
-const express = require("express");
+// =============================================================
+// Required env vars (add to .env):
+//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY
+//   DEEPGRAM_API_KEY
+//   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+//   TWILIO_API_KEY, TWILIO_API_SECRET       (create in Twilio Console → API keys)
+//   TWILIO_TWIML_APP_SID                    (create a TwiML App, Voice URL = APP_BASE_URL/api/twilio/agent)
+//   TWILIO_PHONE_NUMBER                     (your Twilio number, e.g. +14155551234)
+//   APP_BASE_URL                            (public HTTPS URL of this server)
+//   CORS_ORIGIN, PORT
+// =============================================================
+
+const express  = require("express");
+const http     = require("http");
 const { randomUUID } = require("crypto");
-const cors = require("cors");
+const cors     = require("cors");
 const { createClient } = require("@supabase/supabase-js");
-const { analyzeCustomerSpeech } = require("./decisionEngine");
+const WebSocket = require("ws");
+const twilio   = require("twilio");
+const { analyzeCustomerSpeech }                            = require("./decisionEngine");
+const { generateEmbedding, searchKnowledge, generateSuggestedReply } = require("./ragService");
+const { handleMediaStream }                                = require("./transcriptionService");
 require("dotenv").config();
 
-const app = express();
+// ── App + HTTP server (needed for WebSocket upgrade) ──────────
+const app    = express();
+const server = http.createServer(app);
+const wss    = new WebSocket.Server({ noServer: true });
+
+// ── CORS ──────────────────────────────────────────────────────
 const corsOrigin = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
   : true;
@@ -14,20 +36,44 @@ app.use(cors({ origin: corsOrigin }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY, APP_BASE_URL, PORT } =
-  process.env;
+// ── Env validation ────────────────────────────────────────────
+const {
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  GEMINI_API_KEY,
+  APP_BASE_URL,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_API_KEY,
+  TWILIO_API_SECRET,
+  TWILIO_TWIML_APP_SID,
+  TWILIO_PHONE_NUMBER,
+  PORT,
+} = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !GEMINI_API_KEY) {
-  throw new Error(
-    "Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or GEMINI_API_KEY. Update .env using .env.example."
-  );
+  throw new Error("Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or GEMINI_API_KEY.");
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const requestedPort = Number(PORT) || 3000;
+// Twilio REST client (optional — only needed for dialling agents)
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+// Derive WebSocket base URL from APP_BASE_URL
+const WS_BASE_URL = (APP_BASE_URL || "")
+  .replace("https://", "wss://")
+  .replace("http://", "ws://");
+
+const BASE_URL = (APP_BASE_URL || "").replace(/\/+$/, "");
+
+const port          = Number(PORT) || 3000;
 const hasExplicitPort = Boolean(PORT);
 
+// ── Helpers ───────────────────────────────────────────────────
 function escapeXml(value) {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -38,9 +84,7 @@ function escapeXml(value) {
 }
 
 function isUuid(value) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    value
-  );
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function buildPhoneVariants(rawPhone) {
@@ -77,206 +121,299 @@ async function lookupCustomerByPhone(rawPhone) {
     .maybeSingle();
 
   if (error) {
-    console.warn("Customer phone lookup failed:", error.message);
+    console.warn("Customer lookup failed:", error.message);
     return null;
   }
-
   return data || null;
 }
 
-function getProcessActionUrl(req, callId) {
-  const base = (APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
-  const url = new URL(`${base}/api/twilio/process`);
-  if (callId) url.searchParams.set("call_id", callId);
-  return url.toString();
+// ── Conference TwiML builders ─────────────────────────────────
+function customerConferenceTwiml(callId) {
+  const streamUrl  = escapeXml(`${WS_BASE_URL}/api/media-stream?call_id=${callId}&role=customer`);
+  const statusUrl  = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  const room       = `room-${callId}`;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="${streamUrl}" track="inbound_track"/>
+  </Start>
+  <Dial>
+    <Conference beep="false"
+                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                statusCallbackEvent="end"
+                statusCallback="${statusUrl}">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`;
 }
 
-function buildGatherTwiml(actionUrl) {
-  const escaped = escapeXml(actionUrl);
-  return `
-    <Response>
-      <Gather input="speech" action="${escaped}" method="POST" timeout="3" speechTimeout="1" bargeIn="true">
-        <Pause length="1"/>
-      </Gather>
-      <Redirect method="POST">${escaped}</Redirect>
-    </Response>
-  `;
+function agentConferenceTwiml(callId) {
+  const streamUrl = escapeXml(`${WS_BASE_URL}/api/media-stream?call_id=${callId}&role=agent`);
+  const room      = `room-${callId}`;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="${streamUrl}" track="inbound_track"/>
+  </Start>
+  <Dial>
+    <Conference beep="false" waitUrl="">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`;
 }
+
+// ── Routes ────────────────────────────────────────────────────
 
 app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
 
+// -- Twilio Access Token for agent browser softphone ----------
+app.get("/api/token", (_req, res) => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET) {
+    return res.status(503).json({ error: "Twilio credentials not configured." });
+  }
+
+  const AccessToken = twilio.jwt.AccessToken;
+  const VoiceGrant  = AccessToken.VoiceGrant;
+
+  const token = new AccessToken(
+    TWILIO_ACCOUNT_SID,
+    TWILIO_API_KEY,
+    TWILIO_API_SECRET,
+    { identity: "agent", ttl: 3600 }
+  );
+
+  const voiceGrant = new VoiceGrant({
+    outgoingApplicationSid: TWILIO_TWIML_APP_SID || undefined,
+    incomingAllow: true,
+  });
+
+  token.addGrant(voiceGrant);
+  return res.json({ token: token.toJwt() });
+});
+
+// -- Customer calls in → Conference TwiML + dial agent --------
 app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
-  try {
-    const callId = randomUUID();
-    const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
+  const callId      = randomUUID();
+  const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
 
+  try {
     const customer = callerPhone ? await lookupCustomerByPhone(callerPhone) : null;
 
-    // Store call record (fire-and-forget — keep Twilio latency minimal)
-    supabase
-      .from("calls")
-      .insert({
-        id: callId,
-        customer_phone: customer?.phone || callerPhone,
-        customer_name: customer?.name || null,
-        tier: customer?.tier || null,
-        priority: "low",
-      })
-      .then(({ error }) => {
-        if (error) {
-          console.error("Failed to store call, retrying minimal:", error.message);
-          supabase
-            .from("calls")
-            .insert({ id: callId, priority: "low" })
-            .then(({ error: e2 }) => {
-              if (e2) console.error("Fallback call insert failed:", e2.message);
-            });
-        }
-      });
+    // Insert call record immediately (fire-and-forget)
+    supabase.from("calls").insert({
+      id:             callId,
+      customer_phone: customer?.phone || callerPhone,
+      customer_name:  customer?.name  || null,
+      tier:           customer?.tier  || null,
+      priority:       "low",
+    }).then(({ error }) => {
+      if (error) console.error("Call insert error:", error.message);
+    });
 
-    res.send(buildGatherTwiml(getProcessActionUrl(req, callId)));
+    // Dial agent browser (fire-and-forget)
+    if (twilioClient && TWILIO_PHONE_NUMBER) {
+      twilioClient.calls.create({
+        to:   "client:agent",
+        from: TWILIO_PHONE_NUMBER,
+        url:  `${BASE_URL}/api/twilio/agent?call_id=${callId}`,
+      }).catch((err) => console.error("Agent dial error:", err.message));
+    } else {
+      console.warn("Twilio client not configured — agent not dialled.");
+    }
+
+    res.send(customerConferenceTwiml(callId));
   } catch (error) {
     console.error("Voice route error:", error.message);
-    res.set("Content-Type", "text/xml");
-    res.send("<Response><Say>We are having trouble connecting. Please try again.</Say></Response>");
+    res.send(customerConferenceTwiml(callId)); // still put customer in conference
   }
 });
 
-app.post("/api/twilio/process", async (req, res) => {
+// -- Agent leg TwiML (called by Twilio when agent answers) ----
+app.post("/api/twilio/agent", (req, res) => {
   res.set("Content-Type", "text/xml");
 
+  const callId = String(req.query.call_id || "").trim();
+  if (!callId) {
+    return res.send("<Response><Hangup/></Response>");
+  }
+
+  res.send(agentConferenceTwiml(callId));
+});
+
+// -- Conference status callback (called when conference ends) -
+app.post("/api/conference-status", (req, res) => {
+  const callId = String(req.query.call_id || "").trim();
+  const event  = req.body.StatusCallbackEvent;
+
+  if (event === "conference-end" && callId) {
+    console.log(`Conference ended callId=${callId}`);
+    // Optionally update call end time or duration here
+  }
+
+  res.status(200).end();
+});
+
+// -- Knowledge base: add content + embedding ------------------
+app.post("/api/knowledge", async (req, res) => {
+  const content = String(req.body.content || "").trim();
+  const source  = String(req.body.source  || "").trim();
+
+  if (!content) {
+    return res.status(400).json({ error: "content is required." });
+  }
+
   try {
-    const userInput = String(req.body.SpeechResult || "").trim();
-    const incomingCallId = String(req.query.call_id || "").trim();
-    const callId = isUuid(incomingCallId) ? incomingCallId : randomUUID();
-    const nextActionUrl = getProcessActionUrl(req, callId);
+    const embedding = await generateEmbedding(content);
 
-    if (!isUuid(incomingCallId)) {
-      console.warn("Invalid call_id. Using generated fallback.");
-      supabase
-        .from("calls")
-        .insert({ id: callId, priority: "low" })
-        .then(({ error }) => {
-          if (error) console.error("Fallback call insert error:", error.message);
-        });
-    }
+    const { error } = await supabase.from("knowledge_base").insert({
+      content,
+      source:    source || null,
+      embedding,
+    });
 
-    // Respond immediately — AI does NOT speak to the customer
-    res.send(buildGatherTwiml(nextActionUrl));
+    if (error) throw new Error(error.message);
 
-    // Background: store transcript → analyze → push results to dashboard
-    if (userInput) {
-      (async () => {
-        // Store customer speech
-        supabase
-          .from("messages")
-          .insert({ call_id: callId, role: "user", content: userInput })
-          .then(({ error }) => {
-            if (error) console.error("Message insert error:", error.message);
-          });
-
-        // Get customer tier for analysis context
-        const { data: callData } = await supabase
-          .from("calls")
-          .select("tier")
-          .eq("id", callId)
-          .maybeSingle();
-        const tier = callData?.tier || "Regular";
-
-        // Run analysis
-        const result = await analyzeCustomerSpeech(userInput, tier);
-
-        // Persist analysis + update call priority (dashboard gets these via realtime)
-        await Promise.all([
-          supabase
-            .from("analysis")
-            .insert({
-              call_id: callId,
-              emotion: result.emotion,
-              intent: result.intent,
-              priority: result.priority,
-              suggested_actions: result.suggested_actions,
-            })
-            .then(({ error }) => {
-              if (error) console.error("Analysis insert error:", error.message);
-            }),
-          supabase
-            .from("calls")
-            .update({ priority: result.priority })
-            .eq("id", callId)
-            .then(({ error }) => {
-              if (error) console.error("Call priority update error:", error.message);
-            }),
-        ]);
-      })().catch((err) => console.error("Background analysis error:", err.message));
-    }
-  } catch (error) {
-    console.error("Process route error:", error.message);
-    res.send("<Response><Say>A brief issue occurred. Please continue.</Say></Response>");
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Knowledge insert error:", err.message);
+    return res.status(500).json({ error: "Failed to add to knowledge base." });
   }
 });
 
+// -- Customer details -----------------------------------------
 async function fetchCustomerDetails(req, res, overrides = {}) {
-  const id = String(overrides.id ?? req.query.id ?? "").trim();
+  const id    = String(overrides.id    ?? req.query.id    ?? "").trim();
   const email = String(overrides.email ?? req.query.email ?? "").trim();
   const phone = String(overrides.phone ?? req.query.phone ?? "").trim();
 
   if (!id && !email && !phone) {
-    return res
-      .status(400)
-      .json({ error: "Provide at least one query parameter: id, email, or phone." });
+    return res.status(400).json({ error: "Provide id, email, or phone." });
   }
 
   try {
     let query = supabase.from("customers").select("*").limit(1);
 
-    if (id) query = query.eq("id", id);
+    if (id)    query = query.eq("id", id);
     else if (email) query = query.eq("email", email);
-    else query = query.in("phone", buildPhoneVariants(phone));
+    else       query = query.in("phone", buildPhoneVariants(phone));
 
     const { data, error } = await query.maybeSingle();
 
     if (error) {
-      console.error("Failed to fetch customer:", error.message);
-      return res.status(500).json({ error: "Failed to fetch customer details." });
+      console.error("Customer fetch error:", error.message);
+      return res.status(500).json({ error: "Failed to fetch customer." });
     }
 
     if (!data) return res.status(404).json({ error: "Customer not found." });
 
     return res.json({ customer: data });
-  } catch (error) {
-    console.error("customer-details error:", error.message);
+  } catch (err) {
+    console.error("customer-details error:", err.message);
     return res.status(500).json({ error: "Unexpected error." });
   }
 }
 
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
-app.get("/api/customers/:id", (req, res) =>
-  fetchCustomerDetails(req, res, { id: req.params.id })
-);
+app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
 
-function startServer(port) {
-  const server = app.listen(port, () =>
-    console.log(`Agent-assist IVR server running on port ${port}`)
+// ── WebSocket: Twilio Media Streams ──────────────────────────
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url, "http://localhost");
+  if (url.pathname === "/api/media-stream") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on("connection", (ws, req) => {
+  const url    = new URL(req.url, "http://localhost");
+  const callId = url.searchParams.get("call_id");
+  const role   = url.searchParams.get("role") || "customer";
+
+  if (!callId || !isUuid(callId)) {
+    console.warn("Media stream: missing or invalid call_id — closing.");
+    ws.close();
+    return;
+  }
+
+  handleMediaStream(ws, callId, role, supabase, async ({ transcript }) => {
+    // Only run analysis pipeline for customer speech
+    if (role !== "customer") return;
+
+    try {
+      // Fetch customer tier for context
+      const { data: callData } = await supabase
+        .from("calls")
+        .select("tier")
+        .eq("id", callId)
+        .maybeSingle();
+      const tier = callData?.tier || "Regular";
+
+      // Run emotion/intent analysis and embedding in parallel
+      const [analysisResult, embedding] = await Promise.all([
+        analyzeCustomerSpeech(transcript, tier),
+        generateEmbedding(transcript).catch(() => null),
+      ]);
+
+      // RAG: find relevant knowledge base chunks
+      const contextChunks = embedding
+        ? await searchKnowledge(supabase, embedding)
+        : [];
+
+      // Generate suggested reply for agent
+      const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier);
+
+      // Persist analysis (dashboard gets it via Supabase realtime)
+      await Promise.all([
+        supabase.from("analysis").insert({
+          call_id:          callId,
+          emotion:          analysisResult.emotion,
+          intent:           analysisResult.intent,
+          priority:         analysisResult.priority,
+          suggested_actions: analysisResult.suggested_actions,
+          suggested_reply:  suggestedReply,
+        }).then(({ error }) => {
+          if (error) console.error("Analysis insert error:", error.message);
+        }),
+
+        supabase.from("calls").update({ priority: analysisResult.priority })
+          .eq("id", callId)
+          .then(({ error }) => {
+            if (error) console.error("Priority update error:", error.message);
+          }),
+      ]);
+    } catch (err) {
+      console.error("Analysis pipeline error:", err.message);
+    }
+  });
+});
+
+// ── Start server ──────────────────────────────────────────────
+function startServer(p) {
+  server.listen(p, () =>
+    console.log(`Agent-assist IVR server running on port ${p}`)
   );
 
   server.on("error", (error) => {
     if (error.code !== "EADDRINUSE") throw error;
     if (hasExplicitPort) {
-      console.error(
-        `Port ${port} is in use. Stop the other process or set a different PORT in .env.`
-      );
+      console.error(`Port ${p} is in use. Set a different PORT in .env.`);
       process.exit(1);
     }
-    console.warn(`Port ${port} busy. Retrying on ${port + 1}...`);
-    startServer(port + 1);
+    console.warn(`Port ${p} busy. Retrying on ${p + 1}...`);
+    startServer(p + 1);
   });
 }
 
 if (require.main === module) {
-  startServer(requestedPort);
+  startServer(port);
 }
 
-module.exports = { app, startServer };
+module.exports = { app, server };
