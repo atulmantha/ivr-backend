@@ -82,10 +82,26 @@ const port          = Number(PORT) || 3000;
 const hasExplicitPort = Boolean(PORT);
 
 // ── Startup diagnostics ──────────────────────────────────────
-console.log("[startup] APP_BASE_URL  :", BASE_URL   || "(not set — WebSocket streams will fail!)");
-console.log("[startup] WS_BASE_URL   :", WS_BASE_URL || "(not set — WebSocket streams will fail!)");
-console.log("[startup] Twilio client :", twilioClient ? "configured" : "NOT configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
-console.log("[startup] Agent target  :", process.env.AGENT_PHONE_NUMBER || "client:agent (browser softphone)");
+console.log("[startup] APP_BASE_URL    :", BASE_URL    || "(not set — WebSocket streams will fail!)");
+console.log("[startup] WS_BASE_URL     :", WS_BASE_URL || "(not set — WebSocket streams will fail!)");
+console.log("[startup] Twilio client   :", twilioClient ? "configured" : "NOT configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
+console.log("[startup] Agent target    :", process.env.AGENT_PHONE_NUMBER || "client:agent (browser softphone)");
+console.log("[startup] DEEPGRAM_API_KEY:", process.env.DEEPGRAM_API_KEY ? `set (starts with ${process.env.DEEPGRAM_API_KEY.slice(0, 6)}...)` : "NOT SET — transcription will fail!");
+
+// Test Deepgram key at startup via REST API
+if (process.env.DEEPGRAM_API_KEY) {
+  fetch("https://api.deepgram.com/v1/projects", {
+    headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` },
+  }).then((r) => {
+    if (r.ok) {
+      console.log("[startup] Deepgram key verified ✓ (status", r.status, ")");
+    } else {
+      console.error(`[startup] Deepgram key INVALID — HTTP ${r.status}. Get a new key at console.deepgram.com`);
+    }
+  }).catch((err) => {
+    console.error("[startup] Deepgram connectivity test failed:", err.message);
+  });
+}
 
 // ── Helpers ───────────────────────────────────────────────────
 function escapeXml(value) {
