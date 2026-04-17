@@ -7,7 +7,6 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
-    "@deepgram/sdk": "^3.9.0",
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.101.1",
     "cors": "^2.8.6",
@@ -16,8 +15,7 @@
     "mammoth": "^1.8.0",
     "multer": "^2.0.0",
     "pdf-parse": "^1.1.1",
-    "twilio": "^5.4.0",
-    "ws": "^8.18.0"
+    "twilio": "^5.4.0"
   },
   "devDependencies": {
     "jest": "^30.3.0",
