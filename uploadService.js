@@ -46,10 +46,10 @@ async function extractText(file) {
 }
 
 /**
- * Split text into chunks of ~800 characters with 100-char overlap
- * so long documents are searchable and no chunk exceeds embedding limits.
+ * Split text into chunks of ~1500 characters with 100-char overlap.
+ * Larger chunks = fewer rows, less storage, fewer embedding API calls.
  */
-function chunkText(text, chunkSize = 800, overlap = 100) {
+function chunkText(text, chunkSize = 1500, overlap = 100) {
   const normalized = text.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   if (!normalized) return [];
 
