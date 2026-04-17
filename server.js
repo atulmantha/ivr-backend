@@ -2,10 +2,10 @@
 // Required env vars (add to .env):
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY
 //   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
-//   TWILIO_API_KEY, TWILIO_API_SECRET       (create in Twilio Console → API keys)
-//   TWILIO_TWIML_APP_SID                    (create a TwiML App, Voice URL = APP_BASE_URL/api/twilio/agent)
-//   TWILIO_PHONE_NUMBER                     (your Twilio number, e.g. +14155551234)
-//   APP_BASE_URL                            (public HTTPS URL of this server)
+//   TWILIO_API_KEY, TWILIO_API_SECRET
+//   TWILIO_TWIML_APP_SID
+//   TWILIO_PHONE_NUMBER
+//   APP_BASE_URL
 //   CORS_ORIGIN, PORT
 // =============================================================
 
@@ -74,10 +74,8 @@ const port          = Number(PORT) || 3000;
 const hasExplicitPort = Boolean(PORT);
 
 // ── Startup diagnostics ──────────────────────────────────────
-console.log("[startup] APP_BASE_URL  :", BASE_URL || "(not set — transcription callbacks will fail!)");
-console.log("[startup] Twilio client :", twilioClient ? "configured" : "NOT configured (missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
-console.log("[startup] Agent target  :", process.env.AGENT_PHONE_NUMBER || "client:agent (browser softphone)");
-console.log("[startup] Transcription : Twilio native (no Deepgram needed)");
+console.log("[startup] APP_BASE_URL    :", BASE_URL || "(not set!)");
+console.log("[startup] Twilio client   :", twilioClient ? "configured" : "NOT configured");
 
 // ── Helpers ───────────────────────────────────────────────────
 function escapeXml(value) {
@@ -88,7 +86,6 @@ function escapeXml(value) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 }
-
 
 function buildPhoneVariants(rawPhone) {
   const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
@@ -131,23 +128,20 @@ async function lookupCustomerByPhone(rawPhone) {
 }
 
 // ── Conference TwiML builders ─────────────────────────────────
-// Uses Twilio native <Transcription> — no Deepgram, no WebSocket streaming.
-// Twilio POSTs each transcript utterance to /api/transcription?call_id=...
+// Twilio's <Start><Transcription> handles speech-to-text natively.
+// Final transcripts are POSTed to /api/transcription by Twilio.
 function customerConferenceTwiml(callId) {
   const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
   const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
   const room             = `room-${callId}`;
-
-  console.log("[twiml] Transcription callback:", `${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  console.log(`[twiml] Transcription callback: ${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
-    <Transcription
-      transcriptionCallback="${transcriptionUrl}"
-      track="inbound_track"
-      statusCallbackMethod="POST"
-    />
+    <Transcription statusCallbackUrl="${transcriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
   </Start>
   <Dial>
     <Conference beep="false"
@@ -161,10 +155,16 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const room = `room-${callId}`;
+  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const room             = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Start>
+    <Transcription statusCallbackUrl="${transcriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
   <Dial>
     <Conference beep="false" waitUrl="">
       ${room}
@@ -212,8 +212,8 @@ app.post("/api/twilio/voice", async (req, res) => {
   console.log(`\n[voice] ── Incoming call ──────────────────────`);
   console.log(`[voice] callId       : ${callId}`);
   console.log(`[voice] callerPhone  : ${callerPhone || "(unknown)"}`);
-  console.log(`[voice] BASE_URL     : ${BASE_URL || "(NOT SET — transcription callbacks will fail!)"}`);
-  console.log(`[voice] twilioClient : ${twilioClient ? "OK" : "MISSING (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set)"}`);
+  console.log(`[voice] BASE_URL     : ${BASE_URL    || "(NOT SET)"}`);
+  console.log(`[voice] twilioClient : ${twilioClient ? "OK" : "MISSING"}`);
   console.log(`[voice] TWILIO_PHONE : ${TWILIO_PHONE_NUMBER || "(NOT SET)"}`);
 
   try {
@@ -282,10 +282,86 @@ app.post("/api/conference-status", (req, res) => {
 
   if (event === "conference-end" && callId) {
     console.log(`Conference ended callId=${callId}`);
-    // Optionally update call end time or duration here
   }
 
   res.status(200).end();
+});
+
+// -- Twilio transcription webhook -----------------------------
+// Twilio calls this for every transcription event.
+// We only act on final transcripts (Final=true).
+app.post("/api/transcription", async (req, res) => {
+  // Respond immediately so Twilio doesn't retry.
+  res.status(200).end();
+
+  const callId = String(req.query.call_id || "").trim();
+  const role   = String(req.query.role   || "customer").trim();
+  const event  = req.body.TranscriptionEvent;
+  const isFinal = req.body.Final === "true";
+
+  if (!callId || event !== "transcription-content" || !isFinal) return;
+
+  let transcript = "";
+  try {
+    const data = JSON.parse(req.body.TranscriptionData || "{}");
+    transcript = String(data.transcript || "").trim();
+  } catch {
+    return;
+  }
+
+  if (!transcript) {
+    console.log(`[transcript] [${role}] callId=${callId} — empty final transcript`);
+    return;
+  }
+
+  console.log(`[transcript] [${role}] "${transcript.slice(0, 80)}"`);
+
+  // Save the utterance to the messages table
+  const dbRole = role === "agent" ? "agent" : "user";
+  supabase
+    .from("messages")
+    .insert({ call_id: callId, role: dbRole, content: transcript })
+    .then(({ error }) => {
+      if (error) console.error("[transcript] Message insert error:", error.message);
+    });
+
+  // Only run the AI analysis pipeline for customer speech
+  if (role !== "customer") return;
+
+  try {
+    const { data: callData } = await supabase
+      .from("calls").select("tier").eq("id", callId).maybeSingle();
+    const tier = callData?.tier || "Regular";
+
+    const [analysisResult, embedding] = await Promise.all([
+      analyzeCustomerSpeech(transcript, tier),
+      generateEmbedding(transcript).catch(() => null),
+    ]);
+
+    console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
+
+    const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
+    const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier);
+
+    await Promise.all([
+      supabase.from("analysis").insert({
+        call_id:           callId,
+        emotion:           analysisResult.emotion,
+        intent:            analysisResult.intent,
+        priority:          analysisResult.priority,
+        suggested_actions: analysisResult.suggested_actions,
+        suggested_reply:   suggestedReply,
+      }).then(({ error }) => {
+        if (error) console.error("[analysis] Insert error:", error.message);
+        else console.log("[analysis] Saved to DB ✓");
+      }),
+      supabase.from("calls").update({ priority: analysisResult.priority })
+        .eq("id", callId)
+        .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); }),
+    ]);
+  } catch (err) {
+    console.error("[analysis] Pipeline error:", err.message);
+  }
 });
 
 // -- Knowledge base: add text content + embedding -------------
@@ -340,12 +416,11 @@ app.post("/api/knowledge/upload", upload.single("file"), async (req, res) => {
   }
 
   // Respond immediately — embedding can take minutes for large files.
-  // Processing continues in the background.
   res.json({
     success:      true,
     file:         source,
     total_chunks: chunks.length,
-    inserted_chunks: chunks.length, // optimistic; errors logged below
+    inserted_chunks: chunks.length,
     status:       "processing",
   });
 
@@ -419,72 +494,6 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
 
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
 app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
-
-// ── Twilio native transcription callback ─────────────────────
-// Twilio POSTs each final transcript utterance here.
-// No Deepgram, no WebSocket — pure HTTP.
-app.post("/api/transcription", async (req, res) => {
-  res.status(200).end(); // Acknowledge immediately
-
-  const callId     = String(req.query.call_id || "").trim();
-  const role       = String(req.query.role    || "customer").trim();
-  const transcript = String(req.body.TranscriptionText || req.body.UnstableSpeechResult || "").trim();
-
-  if (!callId || !transcript) return;
-
-  console.log(`[transcript] [${role}] callId=${callId}: "${transcript.slice(0, 80)}"`);
-
-  const dbRole = role === "agent" ? "agent" : "user";
-
-  // Save transcript to messages table
-  supabase.from("messages").insert({ call_id: callId, role: dbRole, content: transcript })
-    .then(({ error }) => { if (error) console.error("[transcript] Message insert error:", error.message); });
-
-  // Only run AI analysis pipeline for customer speech
-  if (role !== "customer") return;
-
-  try {
-    const { data: callData } = await supabase
-      .from("calls").select("tier").eq("id", callId).maybeSingle();
-    const tier = callData?.tier || "Regular";
-
-    const [analysisResult, embedding] = await Promise.all([
-      analyzeCustomerSpeech(transcript, tier),
-      generateEmbedding(transcript).catch((err) => {
-        console.error("[analysis] Embedding error:", err.message);
-        return null;
-      }),
-    ]);
-
-    console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
-
-    const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
-    const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier);
-    console.log(`[analysis] Reply: "${(suggestedReply || "").slice(0, 80)}"`);
-
-    await Promise.all([
-      supabase.from("analysis").insert({
-        call_id:           callId,
-        emotion:           analysisResult.emotion,
-        intent:            analysisResult.intent,
-        priority:          analysisResult.priority,
-        suggested_actions: analysisResult.suggested_actions,
-        suggested_reply:   suggestedReply,
-      }).then(({ error }) => {
-        if (error) console.error("[analysis] Insert error:", error.message);
-        else console.log("[analysis] Saved to DB ✓");
-      }),
-
-      supabase.from("calls").update({ priority: analysisResult.priority })
-        .eq("id", callId)
-        .then(({ error }) => {
-          if (error) console.error("[analysis] Priority update error:", error.message);
-        }),
-    ]);
-  } catch (err) {
-    console.error("[analysis] Pipeline error:", err.message);
-  }
-});
 
 // ── Start server ──────────────────────────────────────────────
 function startServer(p) {
