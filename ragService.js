@@ -2,7 +2,12 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+// text-embedding-004 with outputDimensionality=768:
+//   - 4× smaller vectors than gemini-embedding-001 (3072 dims)
+//   - Same model quality for short retrieval tasks
+//   - Saves ~75% Supabase storage and memory during upload
+const embeddingModel = genAI.getGenerativeModel({ model: "text-embedding-004" });
+const EMBEDDING_DIMS = 768;
 
 const replyModel = genAI.getGenerativeModel({
   model: "gemini-2.0-flash-lite",
@@ -13,7 +18,11 @@ async function generateEmbedding(text) {
   const input = String(text || "").trim();
   if (!input) return null;
 
-  const result = await embeddingModel.embedContent(input);
+  const result = await embeddingModel.embedContent({
+    content: { parts: [{ text: input }], role: "user" },
+    taskType: "RETRIEVAL_DOCUMENT",
+    outputDimensionality: EMBEDDING_DIMS,
+  });
   const values = result?.embedding?.values;
 
   if (!Array.isArray(values) || values.length === 0) {
