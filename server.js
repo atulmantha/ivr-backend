@@ -138,6 +138,7 @@ function customerConferenceTwiml(callId) {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="Polly.Joanna">Please hold while we connect you to an agent.</Say>
   <Start>
     <Transcription statusCallbackUrl="${transcriptionUrl}"
                    statusCallbackMethod="POST"
