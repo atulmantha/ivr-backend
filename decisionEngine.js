@@ -1,12 +1,23 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { EMOTIONS, normalizeEmotion } = require("./emotionService");
+const { normalizeEmotion } = require("./emotionService");
 const { normalizeIntent, isHighStakesIntent } = require("./intentService");
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.0-flash-lite",
-  generationConfig: { maxOutputTokens: 300, temperature: 0.2 },
-});
+const GEMINI_GENERATE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
+
+async function geminiGenerate(prompt, maxOutputTokens = 300, temperature = 0.2) {
+  const key = process.env.GEMINI_API_KEY;
+  const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens, temperature },
+    }),
+  });
+  if (!res.ok) throw new Error(`Gemini API ${res.status}`);
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+}
 
 function buildAnalysisPrompt(userInput, tier) {
   return [
@@ -35,12 +46,8 @@ function computePriority(emotion, intent, tier) {
   const isFrustrated = emotion === "frustrated";
   const highStakes = isHighStakesIntent(intent);
 
-  if (isAngry || (isFrustrated && highStakes) || (isHighTier && isAngry)) {
-    return "high";
-  }
-  if (isFrustrated || (isHighTier && highStakes) || (highStakes && emotion !== "calm")) {
-    return "medium";
-  }
+  if (isAngry || (isFrustrated && highStakes) || (isHighTier && isAngry)) return "high";
+  if (isFrustrated || (isHighTier && highStakes) || (highStakes && emotion !== "calm")) return "medium";
   return "low";
 }
 
@@ -52,10 +59,7 @@ async function analyzeCustomerSpeech(userInput, customerTier = "Regular") {
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const result = await model.generateContent(prompt, { signal: controller.signal });
-    const raw = result?.response?.text?.() || "";
-
-    // Strip markdown code fences if model adds them
+    const raw = await geminiGenerate(prompt, 300, 0.2);
     const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
     const parsed = JSON.parse(cleaned);
 
