@@ -276,6 +276,21 @@ app.post("/api/twilio/agent", (req, res) => {
   res.send(agentConferenceTwiml(callId));
 });
 
+// -- Outbound call TwiML (used by TwiML App when agent dials out) -
+app.post("/api/twilio/outbound", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const to = String(req.body.To || "").trim();
+  if (!to || !TWILIO_PHONE_NUMBER) {
+    return res.send("<Response><Hangup/></Response>");
+  }
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial callerId="${escapeXml(TWILIO_PHONE_NUMBER)}">
+    <Number>${escapeXml(to)}</Number>
+  </Dial>
+</Response>`);
+});
+
 // -- Conference status callback (called when conference ends) -
 app.post("/api/conference-status", (req, res) => {
   const callId = String(req.query.call_id || "").trim();
