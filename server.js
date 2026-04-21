@@ -138,7 +138,7 @@ function customerConferenceTwiml(callId) {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Please hold while we connect you to an agent.</Say>
+  <Say voice="alice">Please hold while we connect you to an agent.</Say>
   <Start>
     <Transcription statusCallbackUrl="${transcriptionUrl}"
                    statusCallbackMethod="POST"
@@ -377,6 +377,45 @@ app.post("/api/conference-status", (req, res) => {
   res.status(200).end();
 });
 
+// -- Fetch customer's recent bills from DB (graceful — works even if table missing) --
+async function fetchCustomerBillingContext(customerId, customerPhone, customerName) {
+  // Try to query a `bills` table; adapt to whatever columns exist.
+  try {
+    let query = supabase.from("bills").select("*").order("created_at", { ascending: false }).limit(3);
+    if (customerId)     query = query.eq("customer_id", customerId);
+    else if (customerPhone) query = query.or(`customer_phone.eq.${customerPhone},phone.eq.${customerPhone}`);
+    else if (customerName)  query = query.ilike("customer_name", `%${customerName}%`);
+    else return null;
+
+    const { data, error } = await query;
+    if (error || !data || data.length === 0) return null;
+
+    return data.map((row) => {
+      const parts = [];
+      const month  = row.bill_month  || row.month         || row.billing_period || row.period || null;
+      const amount = row.amount      || row.total_amount  || row.bill_amount    || null;
+      const due    = row.due_date    || row.due           || null;
+      const status = row.status      || row.payment_status|| null;
+      const paid   = row.paid_date   || row.payment_date  || null;
+      if (month)  parts.push(`Month: ${month}`);
+      if (amount) parts.push(`Amount: ${amount}`);
+      if (due)    parts.push(`Due: ${due}`);
+      if (status) parts.push(`Status: ${status}`);
+      if (paid)   parts.push(`Paid on: ${paid}`);
+      // Fall back: any remaining string columns
+      if (parts.length === 0) {
+        Object.entries(row).forEach(([k, v]) => {
+          if (k !== "id" && k !== "customer_id" && v != null)
+            parts.push(`${k}: ${v}`);
+        });
+      }
+      return parts.join(", ");
+    }).filter(Boolean).join("\n");
+  } catch {
+    return null;
+  }
+}
+
 // -- Twilio transcription webhook -----------------------------
 // Twilio calls this for every transcription event.
 // We only act on final transcripts (Final=true).
@@ -384,18 +423,24 @@ app.post("/api/transcription", async (req, res) => {
   // Respond immediately so Twilio doesn't retry.
   res.status(200).end();
 
-  const callId = String(req.query.call_id || "").trim();
-  const role   = String(req.query.role   || "customer").trim();
-  const event  = req.body.TranscriptionEvent;
+  const callId  = String(req.query.call_id || "").trim();
+  const role    = String(req.query.role    || "customer").trim();
+  const event   = req.body.TranscriptionEvent;
   const isFinal = req.body.Final === "true";
 
-  if (!callId || event !== "transcription-content" || !isFinal) return;
+  // Log every event so we can see what Twilio is sending
+  console.log(`[transcript] event=${event} final=${req.body.Final} role=${role} callId=${callId}`);
+
+  if (!callId) { console.warn("[transcript] Missing call_id — skipping"); return; }
+  if (event !== "transcription-content") { console.log(`[transcript] Skipping event type: ${event}`); return; }
+  if (!isFinal) { console.log("[transcript] Partial transcript — waiting for final"); return; }
 
   let transcript = "";
   try {
     const data = JSON.parse(req.body.TranscriptionData || "{}");
     transcript = String(data.transcript || "").trim();
   } catch {
+    console.warn("[transcript] Failed to parse TranscriptionData:", req.body.TranscriptionData);
     return;
   }
 
@@ -404,7 +449,7 @@ app.post("/api/transcription", async (req, res) => {
     return;
   }
 
-  console.log(`[transcript] [${role}] "${transcript.slice(0, 80)}"`);
+  console.log(`[transcript] [${role}] "${transcript.slice(0, 120)}"`);
 
   // Save the utterance to the messages table
   const dbRole = role === "agent" ? "agent" : "user";
@@ -413,25 +458,40 @@ app.post("/api/transcription", async (req, res) => {
     .insert({ call_id: callId, role: dbRole, content: transcript })
     .then(({ error }) => {
       if (error) console.error("[transcript] Message insert error:", error.message);
+      else console.log(`[transcript] Message saved ✓ role=${dbRole}`);
     });
 
   // Only run the AI analysis pipeline for customer speech
   if (role !== "customer") return;
 
   try {
+    // Fetch full call + customer data for context
     const { data: callData } = await supabase
-      .from("calls").select("tier").eq("id", callId).maybeSingle();
-    const tier = callData?.tier || "Regular";
+      .from("calls").select("*").eq("id", callId).maybeSingle();
+    const tier         = callData?.tier         || "Regular";
+    const customerName = callData?.customer_name || null;
+    const customerPhone= callData?.customer_phone|| null;
+
+    // Enrich the embedding query with customer name so we find their specific bills/docs
+    const searchQuery = customerName ? `${customerName} ${transcript}` : transcript;
 
     const [analysisResult, embedding] = await Promise.all([
       analyzeCustomerSpeech(transcript, tier),
-      generateEmbedding(transcript).catch(() => null),
+      generateEmbedding(searchQuery).catch(() => null),
     ]);
 
     console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
 
-    const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
-    const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier);
+    // Fetch knowledge base context + customer billing data in parallel
+    const [contextChunks, billingContext] = await Promise.all([
+      embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
+      fetchCustomerBillingContext(null, customerPhone, customerName),
+    ]);
+
+    if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
+
+    const customerData = { name: customerName, tier, billingContext };
+    const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
 
     await Promise.all([
       supabase.from("analysis").insert({

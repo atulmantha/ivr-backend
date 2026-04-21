@@ -50,21 +50,34 @@ async function searchKnowledge(supabase, embedding) {
   return (data || []).map((r) => r.content).filter(Boolean);
 }
 
-async function generateSuggestedReply(userInput, contextChunks, tier = "Regular") {
+async function generateSuggestedReply(userInput, contextChunks, tier = "Regular", customerData = null) {
   const context = contextChunks.length > 0 ? contextChunks.join("\n\n") : null;
+
+  // Build customer-specific account section
+  const accountLines = [];
+  if (customerData?.name)           accountLines.push(`Customer name: ${customerData.name}`);
+  if (customerData?.tier)           accountLines.push(`Tier: ${customerData.tier}`);
+  if (customerData?.billingContext) accountLines.push(`Recent bills:\n${customerData.billingContext}`);
+  const accountSection = accountLines.length > 0
+    ? `Customer account information:\n${accountLines.join("\n")}`
+    : null;
 
   const prompt = [
     `You are coaching a call center agent. A ${tier} tier customer said:`,
     `"${userInput}"`,
     "",
+    accountSection || "",
     context
       ? `Relevant knowledge base context:\n${context}`
       : "No specific knowledge base context found.",
     "",
     "Write the exact words the agent should say in response.",
     "1-2 sentences. Professional, empathetic, and direct.",
+    accountSection
+      ? "If the customer is asking about their bill or account, refer to the specific bill details above."
+      : "",
     "Return only the reply text — no labels, no quotes.",
-  ].join("\n");
+  ].filter((line) => line !== "").join("\n");
 
   const key = process.env.GEMINI_API_KEY;
   const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
