@@ -138,6 +138,7 @@ function customerConferenceTwiml(callId) {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="Polly.Joanna">Please hold while we connect you to an agent.</Say>
   <Start>
     <Transcription statusCallbackUrl="${transcriptionUrl}"
                    statusCallbackMethod="POST"
@@ -273,6 +274,95 @@ app.post("/api/twilio/agent", (req, res) => {
   }
 
   res.send(agentConferenceTwiml(callId));
+});
+
+// -- Outbound call: agent leg (TwiML App calls this when agent dials) -
+app.post("/api/twilio/outbound", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const to = String(req.body.To || "").trim();
+
+  if (!to || !TWILIO_PHONE_NUMBER || !twilioClient) {
+    return res.send("<Response><Hangup/></Response>");
+  }
+
+  const callId = randomUUID();
+  const room   = `room-${callId}`;
+
+  console.log(`\n[outbound] ── Outbound call ───────────────────`);
+  console.log(`[outbound] callId : ${callId}`);
+  console.log(`[outbound] to     : ${to}`);
+
+  // Insert call record then update with customer info if found
+  supabase.from("calls").insert({
+    id:             callId,
+    customer_phone: to,
+    customer_name:  null,
+    tier:           null,
+    priority:       "low",
+  }).then(({ error }) => {
+    if (error) console.error("[outbound] Call insert error:", error.message);
+    else console.log(`[outbound] Call inserted in DB ✓`);
+  });
+
+  lookupCustomerByPhone(to).then((customer) => {
+    if (!customer) return;
+    supabase.from("calls").update({ customer_name: customer.name, tier: customer.tier })
+      .eq("id", callId).then(({ error }) => {
+        if (error) console.error("[outbound] Customer update error:", error.message);
+      });
+  });
+
+  // Dial the customer into the same conference room via REST API
+  const customerUrl = `${BASE_URL}/api/twilio/outbound-customer?call_id=${callId}`;
+  twilioClient.calls.create({ to, from: TWILIO_PHONE_NUMBER, url: customerUrl })
+    .then((call) => console.log(`[outbound] Customer dialed ✓ SID=${call.sid}`))
+    .catch((err) => console.error(`[outbound] Customer dial FAILED: ${err.message}`));
+
+  // Put agent into the conference room with transcription
+  const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Transcription statusCallbackUrl="${agentTranscriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
+  <Dial>
+    <Conference beep="false"
+                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                statusCallbackEvent="end"
+                statusCallback="${statusUrl}">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`);
+  console.log(`[outbound] Agent TwiML sent ✓`);
+});
+
+// -- Outbound call: customer leg (Twilio calls this when customer answers) -
+app.post("/api/twilio/outbound-customer", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const callId = String(req.query.call_id || "").trim();
+  if (!callId) return res.send("<Response><Hangup/></Response>");
+
+  const room                    = `room-${callId}`;
+  const customerTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Transcription statusCallbackUrl="${customerTranscriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
+  <Dial>
+    <Conference beep="false" waitUrl="">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`);
 });
 
 // -- Conference status callback (called when conference ends) -
