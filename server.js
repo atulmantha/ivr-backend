@@ -482,33 +482,55 @@ app.post("/api/transcription", async (req, res) => {
 
     console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
 
-    // Fetch knowledge base context + customer billing data in parallel
-    const [contextChunks, billingContext] = await Promise.all([
-      embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
-      fetchCustomerBillingContext(null, customerPhone, customerName),
-    ]);
-
-    if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
-
-    const customerData = { name: customerName, tier, billingContext };
-    const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
-
-    await Promise.all([
-      supabase.from("analysis").insert({
+    // ── Step 1: save basic analysis immediately so frontend shows it right away ──
+    const { data: savedRows, error: insertErr } = await supabase
+      .from("analysis")
+      .insert({
         call_id:           callId,
         emotion:           analysisResult.emotion,
         intent:            analysisResult.intent,
         priority:          analysisResult.priority,
         suggested_actions: analysisResult.suggested_actions,
-        suggested_reply:   suggestedReply,
-      }).then(({ error }) => {
-        if (error) console.error("[analysis] Insert error:", error.message);
-        else console.log("[analysis] Saved to DB ✓");
-      }),
-      supabase.from("calls").update({ priority: analysisResult.priority })
-        .eq("id", callId)
-        .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); }),
-    ]);
+        suggested_reply:   null,
+      })
+      .select("id");
+
+    if (insertErr) {
+      console.error("[analysis] Insert error:", insertErr.message);
+    } else {
+      console.log("[analysis] Basic analysis saved ✓");
+    }
+
+    // Update call priority immediately
+    supabase.from("calls").update({ priority: analysisResult.priority })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); });
+
+    // ── Step 2: generate suggested reply and update the row (non-blocking for step 1) ──
+    try {
+      const [contextChunks, billingContext] = await Promise.all([
+        embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
+        fetchCustomerBillingContext(null, customerPhone, customerName),
+      ]);
+
+      if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
+
+      const customerData  = { name: customerName, tier, billingContext };
+      const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
+
+      const analysisId = savedRows?.[0]?.id;
+      if (analysisId && suggestedReply) {
+        supabase.from("analysis")
+          .update({ suggested_reply: suggestedReply })
+          .eq("id", analysisId)
+          .then(({ error }) => {
+            if (error) console.error("[analysis] Reply update error:", error.message);
+            else console.log("[analysis] Suggested reply saved ✓");
+          });
+      }
+    } catch (replyErr) {
+      console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
+    }
   } catch (err) {
     console.error("[analysis] Pipeline error:", err.message);
   }
