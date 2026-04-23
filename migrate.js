@@ -41,9 +41,15 @@ CREATE TABLE IF NOT EXISTS calls (
   customer_name    TEXT,
   tier             TEXT,
   priority         TEXT        DEFAULT 'low',
+  status           TEXT        DEFAULT 'active',
+  ivr_category     TEXT,
   duration_seconds INTEGER,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Add columns to existing calls table (safe to re-run)
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS ivr_category TEXT;
 
 -- messages (live transcript)
 CREATE TABLE IF NOT EXISTS messages (

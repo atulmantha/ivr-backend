@@ -139,7 +139,7 @@ function customerConferenceTwiml(callId) {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Please hold while we connect you to an agent.</Say>
+  <Say voice="alice">Thank you. Connecting you to an agent now. Please hold.</Say>
   <Start>
     <Transcription statusCallbackUrl="${transcriptionUrl}"
                    statusCallbackMethod="POST"
@@ -175,6 +175,74 @@ function agentConferenceTwiml(callId) {
 </Response>`;
 }
 
+// ── Shared AI analysis pipeline ───────────────────────────────
+// Called from both /api/transcription (conference speech) and
+// /api/twilio/ivr-query (IVR-captured user query).
+async function runAnalysisPipeline(callId, transcript) {
+  try {
+    const { data: callData } = await supabase
+      .from("calls").select("*").eq("id", callId).maybeSingle();
+    const tier          = callData?.tier          || "Regular";
+    const customerName  = callData?.customer_name || null;
+    const customerPhone = callData?.customer_phone || null;
+
+    const searchQuery = customerName ? `${customerName} ${transcript}` : transcript;
+
+    const [analysisResult, embedding] = await Promise.all([
+      analyzeCustomerSpeech(transcript, tier),
+      generateEmbedding(searchQuery).catch(() => null),
+    ]);
+
+    console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
+
+    const { data: savedRows, error: insertErr } = await supabase
+      .from("analysis")
+      .insert({
+        call_id:           callId,
+        emotion:           analysisResult.emotion,
+        intent:            analysisResult.intent,
+        priority:          analysisResult.priority,
+        suggested_actions: analysisResult.suggested_actions,
+        suggested_reply:   null,
+      })
+      .select("id");
+
+    if (insertErr) console.error("[analysis] Insert error:", insertErr.message);
+    else console.log("[analysis] Basic analysis saved ✓");
+
+    supabase.from("calls").update({ priority: analysisResult.priority })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); });
+
+    try {
+      const [contextChunks, billingContext] = await Promise.all([
+        embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
+        fetchCustomerBillingContext(null, customerPhone, customerName),
+      ]);
+
+      if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
+
+      const customerData   = { name: customerName, tier, billingContext };
+      const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
+
+      const analysisId = savedRows?.[0]?.id;
+      if (analysisId && suggestedReply) {
+        supabase.from("analysis")
+          .update({ suggested_reply: suggestedReply })
+          .eq("id", analysisId)
+          .then(({ error }) => {
+            if (error) console.error("[analysis] Reply update error:", error.message);
+            else console.log("[analysis] Suggested reply saved ✓");
+          });
+      }
+    } catch (replyErr) {
+      console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
+    }
+  } catch (err) {
+    console.error("[analysis] Pipeline error:", err.message);
+  }
+}
+
 // ── Routes ────────────────────────────────────────────────────
 
 app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
@@ -204,7 +272,9 @@ app.get("/api/token", (_req, res) => {
   return res.json({ token: token.toJwt() });
 });
 
-// -- Customer calls in → Conference TwiML + dial agent --------
+// -- Customer calls in → IVR greeting + menu -----------------
+// Agent is NOT dialled here; dialling happens after the customer
+// completes the IVR so the agent only rings when ready to talk.
 app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
@@ -212,57 +282,195 @@ app.post("/api/twilio/voice", async (req, res) => {
   const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
 
   console.log(`\n[voice] ── Incoming call ──────────────────────`);
-  console.log(`[voice] callId       : ${callId}`);
-  console.log(`[voice] callerPhone  : ${callerPhone || "(unknown)"}`);
-  console.log(`[voice] BASE_URL     : ${BASE_URL    || "(NOT SET)"}`);
-  console.log(`[voice] twilioClient : ${twilioClient ? "OK" : "MISSING"}`);
-  console.log(`[voice] TWILIO_PHONE : ${TWILIO_PHONE_NUMBER || "(NOT SET)"}`);
+  console.log(`[voice] callId      : ${callId}`);
+  console.log(`[voice] callerPhone : ${callerPhone || "(unknown)"}`);
 
   try {
     const customer = callerPhone ? await lookupCustomerByPhone(callerPhone) : null;
-    console.log(`[voice] customer     : ${customer ? `${customer.name} / tier=${customer.tier}` : "not found in DB"}`);
+    console.log(`[voice] customer    : ${customer ? `${customer.name} / tier=${customer.tier}` : "not found in DB"}`);
 
-    // Insert call record immediately (fire-and-forget)
+    // Insert call record with 'ivr' status so dashboard shows it immediately
     supabase.from("calls").insert({
       id:             callId,
       customer_phone: customer?.phone || callerPhone,
       customer_name:  customer?.name  || null,
       tier:           customer?.tier  || null,
       priority:       "low",
+      status:         "ivr",
     }).then(({ error }) => {
       if (error) console.error("[voice] Call insert error:", error.message);
       else console.log(`[voice] Call inserted in DB ✓`);
     });
 
-    // Dial agent browser (laptop dashboard)
-    if (twilioClient && TWILIO_PHONE_NUMBER) {
-      const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-      console.log(`[voice] Dialling agent → client:agent`);
-      console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
-      twilioClient.calls.create({
-        to:   "client:agent",
-        from: TWILIO_PHONE_NUMBER,
-        url:  agentUrl,
-      }).then((call) => {
-        console.log(`[voice] Agent call created ✓ SID=${call.sid}`);
-      }).catch((err) => {
-        console.error(`[voice] Agent dial FAILED: ${err.message}`);
-        console.error(`[voice] Twilio error code : ${err.code || "n/a"}`);
-        console.error(`[voice] Twilio more info  : ${err.moreInfo || "n/a"}`);
-      });
-    } else {
-      console.warn("[voice] ERROR: Twilio client not configured — agent NOT dialled.");
-      console.warn(`[voice]   TWILIO_ACCOUNT_SID : ${TWILIO_ACCOUNT_SID ? "set" : "MISSING"}`);
-      console.warn(`[voice]   TWILIO_AUTH_TOKEN  : ${TWILIO_AUTH_TOKEN  ? "set" : "MISSING"}`);
-      console.warn(`[voice]   TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER ? "set" : "MISSING"}`);
-    }
+    // Personalised verification greeting
+    const greeting = customer
+      ? `Hello ${escapeXml(customer.name)}, welcome to BrightSuite support. Your account has been verified.`
+      : "Welcome to BrightSuite support. I was unable to locate your account automatically, but I'll connect you with our team.";
 
-    res.send(customerConferenceTwiml(callId));
-    console.log(`[voice] Customer TwiML sent ✓`);
+    const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
+
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">${greeting}</Say>
+  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
+    <Say voice="alice">For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
+    console.log(`[voice] IVR TwiML sent ✓`);
   } catch (error) {
     console.error("[voice] Unexpected error:", error.message);
+    // Fallback: skip IVR and connect directly
     res.send(customerConferenceTwiml(callId));
   }
+});
+
+// -- IVR: menu selection handler ------------------------------
+// Called by Twilio after customer presses a digit or speaks.
+app.post("/api/twilio/ivr-menu", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  const callId      = String(req.query.call_id   || "").trim();
+  const digits      = String(req.body.Digits      || "").trim();
+  const speech      = String(req.body.SpeechResult || "").trim();
+
+  console.log(`[ivr-menu] callId=${callId} digits="${digits}" speech="${speech.slice(0, 60)}"`);
+
+  // Map input to a support category
+  let category, categoryLabel;
+  if (digits === "1" || /billing|bill|payment|invoice|charge/i.test(speech)) {
+    category = "billing";      categoryLabel = "Billing";
+  } else if (digits === "2" || /new line|new service|add line|upgrade|plan|activate/i.test(speech)) {
+    category = "new_lines";    categoryLabel = "New Lines and Services";
+  } else if (digits === "3" || /service|technical|issue|problem|not working|outage|slow|broken/i.test(speech)) {
+    category = "service";      categoryLabel = "Service Support";
+  } else {
+    category = "general";      categoryLabel = "Support";
+  }
+
+  if (callId) {
+    supabase.from("calls").update({ ivr_category: category })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[ivr-menu] Category update:", error.message); });
+  }
+
+  const queryUrl   = escapeXml(`${BASE_URL}/api/twilio/ivr-query?call_id=${callId}&category=${category}`);
+  const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=query&category=${category}&attempt=1`);
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="${queryUrl}" method="POST" timeout="8" speechTimeout="auto">
+    <Say voice="alice">I will connect you with our ${escapeXml(categoryLabel)} team. Please briefly describe your issue in a few words.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
+});
+
+// -- IVR: capture user query, save to DB, dial agent ----------
+// Only the customer's spoken query is stored — IVR prompts are never saved.
+app.post("/api/twilio/ivr-query", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const category = String(req.query.category || "general").trim();
+  const speech   = String(req.body.SpeechResult || "").trim();
+
+  console.log(`[ivr-query] callId=${callId} category=${category} speech="${speech.slice(0, 80)}"`);
+
+  if (callId && speech) {
+    // Persist only the user's actual problem statement
+    supabase.from("messages").insert({ call_id: callId, role: "user", content: speech })
+      .then(({ error }) => {
+        if (error) console.error("[ivr-query] Message insert error:", error.message);
+        else console.log(`[ivr-query] User query saved ✓`);
+      });
+
+    // Kick off AI analysis so suggestions are ready when agent joins
+    runAnalysisPipeline(callId, speech).catch((err) =>
+      console.error("[ivr-query] Analysis pipeline error:", err.message)
+    );
+  }
+
+  // Mark call as active and lock in the category
+  if (callId) {
+    supabase.from("calls").update({ status: "active", ivr_category: category })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[ivr-query] Call update:", error.message); });
+  }
+
+  // Dial the agent browser now that the customer is ready to talk
+  if (twilioClient && TWILIO_PHONE_NUMBER && callId) {
+    const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    console.log(`[ivr-query] Dialling agent → client:agent`);
+    twilioClient.calls.create({
+      to:   "client:agent",
+      from: TWILIO_PHONE_NUMBER,
+      url:  agentUrl,
+    }).then((call) => {
+      console.log(`[ivr-query] Agent call created ✓ SID=${call.sid}`);
+    }).catch((err) => {
+      console.error(`[ivr-query] Agent dial FAILED: ${err.message}`);
+    });
+  } else {
+    console.warn("[ivr-query] Twilio client not configured — agent NOT dialled.");
+  }
+
+  // Put the customer into the conference room (hold music plays until agent joins)
+  res.send(customerConferenceTwiml(callId));
+  console.log(`[ivr-query] Customer conference TwiML sent ✓`);
+});
+
+// -- IVR: no-input handler ------------------------------------
+// First attempt: reprompt with "I have not received any input."
+// Second attempt: disconnect gracefully.
+app.post("/api/twilio/ivr-noinput", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const step     = String(req.query.step     || "menu").trim();
+  const category = String(req.query.category || "general").trim();
+  const attempt  = parseInt(req.query.attempt || "1", 10);
+
+  console.log(`[ivr-noinput] callId=${callId} step=${step} attempt=${attempt}`);
+
+  if (attempt >= 2) {
+    // Second silence → disconnect gracefully
+    if (callId) {
+      supabase.from("calls").update({ status: "disconnected" })
+        .eq("id", callId)
+        .then(({ error }) => { if (error) console.error("[ivr-noinput] Status update:", error.message); });
+    }
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We did not receive a response. Thank you for calling BrightSuite. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+  }
+
+  // First silence — reprompt based on which step timed out
+  if (step === "query") {
+    const queryUrl   = escapeXml(`${BASE_URL}/api/twilio/ivr-query?call_id=${callId}&category=${category}`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=query&category=${category}&attempt=2`);
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="${queryUrl}" method="POST" timeout="8" speechTimeout="auto">
+    <Say voice="alice">I have not received any input. Please tell your query in a few words.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
+  }
+
+  // step === "menu"
+  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
+  const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=2`);
+  return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
+    <Say voice="alice">I have not received any input. For Billing press 1, for New Lines or New Services press 2, for Service related Queries press 3. Or please tell me how I can help you.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
@@ -372,7 +580,13 @@ app.post("/api/conference-status", (req, res) => {
   const event  = req.body.StatusCallbackEvent;
 
   if (event === "conference-end" && callId) {
-    console.log(`Conference ended callId=${callId}`);
+    console.log(`[conference-status] Conference ended callId=${callId}`);
+    supabase.from("calls").update({ status: "disconnected" })
+      .eq("id", callId)
+      .then(({ error }) => {
+        if (error) console.error("[conference-status] Status update:", error.message);
+        else console.log(`[conference-status] Call ${callId} marked disconnected ✓`);
+      });
   }
 
   res.status(200).end();
@@ -465,76 +679,9 @@ app.post("/api/transcription", async (req, res) => {
   // Only run the AI analysis pipeline for customer speech
   if (role !== "customer") return;
 
-  try {
-    // Fetch full call + customer data for context
-    const { data: callData } = await supabase
-      .from("calls").select("*").eq("id", callId).maybeSingle();
-    const tier         = callData?.tier         || "Regular";
-    const customerName = callData?.customer_name || null;
-    const customerPhone= callData?.customer_phone|| null;
-
-    // Enrich the embedding query with customer name so we find their specific bills/docs
-    const searchQuery = customerName ? `${customerName} ${transcript}` : transcript;
-
-    const [analysisResult, embedding] = await Promise.all([
-      analyzeCustomerSpeech(transcript, tier),
-      generateEmbedding(searchQuery).catch(() => null),
-    ]);
-
-    console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
-
-    // ── Step 1: save basic analysis immediately so frontend shows it right away ──
-    const { data: savedRows, error: insertErr } = await supabase
-      .from("analysis")
-      .insert({
-        call_id:           callId,
-        emotion:           analysisResult.emotion,
-        intent:            analysisResult.intent,
-        priority:          analysisResult.priority,
-        suggested_actions: analysisResult.suggested_actions,
-        suggested_reply:   null,
-      })
-      .select("id");
-
-    if (insertErr) {
-      console.error("[analysis] Insert error:", insertErr.message);
-    } else {
-      console.log("[analysis] Basic analysis saved ✓");
-    }
-
-    // Update call priority immediately
-    supabase.from("calls").update({ priority: analysisResult.priority })
-      .eq("id", callId)
-      .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); });
-
-    // ── Step 2: generate suggested reply and update the row (non-blocking for step 1) ──
-    try {
-      const [contextChunks, billingContext] = await Promise.all([
-        embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
-        fetchCustomerBillingContext(null, customerPhone, customerName),
-      ]);
-
-      if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
-
-      const customerData  = { name: customerName, tier, billingContext };
-      const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
-
-      const analysisId = savedRows?.[0]?.id;
-      if (analysisId && suggestedReply) {
-        supabase.from("analysis")
-          .update({ suggested_reply: suggestedReply })
-          .eq("id", analysisId)
-          .then(({ error }) => {
-            if (error) console.error("[analysis] Reply update error:", error.message);
-            else console.log("[analysis] Suggested reply saved ✓");
-          });
-      }
-    } catch (replyErr) {
-      console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
-    }
-  } catch (err) {
-    console.error("[analysis] Pipeline error:", err.message);
-  }
+  runAnalysisPipeline(callId, transcript).catch((err) =>
+    console.error("[transcription] Analysis pipeline error:", err.message)
+  );
 });
 
 // -- Knowledge base: add text content + embedding -------------
