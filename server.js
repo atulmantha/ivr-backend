@@ -289,17 +289,19 @@ app.post("/api/twilio/voice", async (req, res) => {
     const customer = callerPhone ? await lookupCustomerByPhone(callerPhone) : null;
     console.log(`[voice] customer    : ${customer ? `${customer.name} / tier=${customer.tier}` : "not found in DB"}`);
 
-    // Insert call record with 'ivr' status so dashboard shows it immediately
+    // Insert call record — status/ivr_category updated separately so the
+    // INSERT succeeds even if those columns haven't been migrated yet.
     supabase.from("calls").insert({
       id:             callId,
       customer_phone: customer?.phone || callerPhone,
       customer_name:  customer?.name  || null,
       tier:           customer?.tier  || null,
       priority:       "low",
-      status:         "ivr",
     }).then(({ error }) => {
-      if (error) console.error("[voice] Call insert error:", error.message);
-      else console.log(`[voice] Call inserted in DB ✓`);
+      if (error) { console.error("[voice] Call insert error:", error.message); return; }
+      console.log(`[voice] Call inserted in DB ✓`);
+      // Best-effort status update (silent if column not yet migrated)
+      supabase.from("calls").update({ status: "ivr" }).eq("id", callId).then(() => {});
     });
 
     // Personalised verification greeting
