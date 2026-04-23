@@ -63,20 +63,22 @@ async function generateSuggestedReply(userInput, contextChunks, tier = "Regular"
     : null;
 
   const prompt = [
-    `You are coaching a call center agent. A ${tier} tier customer said:`,
-    `"${userInput}"`,
+    `You are coaching a call center agent handling a ${tier} tier customer.`,
+    `The customer said: "${userInput}"`,
     "",
-    accountSection || "",
+    accountSection ? accountSection : "",
     context
-      ? `Relevant knowledge base context:\n${context}`
-      : "No specific knowledge base context found.",
+      ? `Retrieved account / knowledge base data:\n${context}`
+      : "No specific account data found in the knowledge base.",
     "",
-    "Write the exact words the agent should say in response.",
-    "1-2 sentences. Professional, empathetic, and direct.",
-    accountSection
-      ? "If the customer is asking about their bill or account, refer to the specific bill details above."
-      : "",
-    "Return only the reply text — no labels, no quotes.",
+    "Write the exact words the agent should say to the customer.",
+    "Rules:",
+    "- 1-3 sentences. Professional, empathetic, and direct.",
+    "- If the retrieved data contains specific bill amounts, payment dates, due dates, or account figures, state them explicitly and precisely in the reply.",
+    "- NEVER say 'I will look that up', 'let me check', or 'one moment' if the data is already present above — quote it directly.",
+    "- If the data is genuinely not available, acknowledge that and offer the next step.",
+    "- Address the customer by name if known.",
+    "Return only the agent's reply text — no labels, no quotes, no preamble.",
   ].filter((line) => line !== "").join("\n");
 
   const key = process.env.GEMINI_API_KEY;
@@ -85,7 +87,7 @@ async function generateSuggestedReply(userInput, contextChunks, tier = "Regular"
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 150, temperature: 0.3 },
+      generationConfig: { maxOutputTokens: 200, temperature: 0.2 },
     }),
   });
 
