@@ -304,17 +304,11 @@ app.post("/api/twilio/voice", async (req, res) => {
       supabase.from("calls").update({ status: "ivr" }).eq("id", callId).then(() => {});
     });
 
-    // Personalised verification greeting
-    const greeting = customer
-      ? `Hello ${escapeXml(customer.name)}, welcome to BrightSuite support. Your account has been verified.`
-      : "Welcome to BrightSuite support. I was unable to locate your account automatically, but I'll connect you with our team.";
-
     const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
     const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
 
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">${greeting}</Say>
   <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
     <Say voice="alice">For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
   </Gather>
