@@ -175,6 +175,39 @@ function agentConferenceTwiml(callId) {
 </Response>`;
 }
 
+// ── Billing lookup from knowledge_base by customer name ──────
+// Handles cases where bills are stored directly in knowledge_base
+// as structured rows with name / billing_date / due_date / invoice_no etc.
+async function fetchBillingFromKnowledgeBase(customerName) {
+  if (!customerName) return null;
+  try {
+    const { data, error } = await supabase
+      .from("knowledge_base")
+      .select("*")
+      .ilike("name", `%${customerName}%`)
+      .order("billing_date", { ascending: false })
+      .limit(3);
+
+    if (error || !data || data.length === 0) return null;
+
+    const skip = new Set(["id", "embedding", "content", "source", "created_at"]);
+    const rows = data.map((row) => {
+      const parts = [];
+      Object.entries(row).forEach(([k, v]) => {
+        if (!skip.has(k) && v != null && String(v).trim()) {
+          const label = k.replace(/_/g, " ");
+          parts.push(`${label}: ${v}`);
+        }
+      });
+      return parts.join(" | ");
+    }).filter(Boolean);
+
+    return rows.length > 0 ? rows.join("\n") : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Shared AI analysis pipeline ───────────────────────────────
 // Called from both /api/transcription (conference speech) and
 // /api/twilio/ivr-query (IVR-captured user query).
@@ -215,11 +248,13 @@ async function runAnalysisPipeline(callId, transcript) {
       .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); });
 
     try {
-      const [contextChunks, billingContext] = await Promise.all([
+      const [contextChunks, billsTableCtx, kbBillingCtx] = await Promise.all([
         embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
         fetchCustomerBillingContext(null, customerPhone, customerName),
+        fetchBillingFromKnowledgeBase(customerName),
       ]);
 
+      const billingContext = [billsTableCtx, kbBillingCtx].filter(Boolean).join("\n") || null;
       if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
 
       const customerData   = { name: customerName, tier, billingContext };
