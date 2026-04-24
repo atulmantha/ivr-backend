@@ -16,7 +16,7 @@ const cors     = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const twilio   = require("twilio");
 const { analyzeCustomerSpeech }                            = require("./decisionEngine");
-const { generateEmbedding, searchKnowledge, generateSuggestedReply } = require("./ragService");
+const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
 const { runMigrations }                                    = require("./migrate");
 require("dotenv").config({ quiet: true });
@@ -208,6 +208,41 @@ async function fetchBillingFromKnowledgeBase(customerName) {
   }
 }
 
+// ── Combine recent speech-to-text fragments ───────────────────
+// Speech-to-text often splits a single utterance into 2-3 short messages.
+// This fetches the last few user messages within a 45-second window and
+// joins them so the AI sees the full intended sentence.
+async function getCombinedUserTranscript(callId, latestTranscript) {
+  try {
+    const { data } = await supabase
+      .from("messages")
+      .select("content, created_at")
+      .eq("call_id", callId)
+      .eq("role", "user")
+      .order("created_at", { ascending: false })
+      .limit(4);
+
+    if (!data || data.length === 0) return latestTranscript;
+
+    const WINDOW_MS = 45_000; // 45 seconds — covers typical STT lag
+    const latestTime = new Date(data[0].created_at).getTime();
+
+    const recentFragments = data
+      .filter((m) => latestTime - new Date(m.created_at).getTime() < WINDOW_MS)
+      .reverse()
+      .map((m) => String(m.content || "").trim())
+      .filter(Boolean);
+
+    const combined = recentFragments.join(" ");
+    if (combined !== latestTranscript) {
+      console.log(`[analysis] Combined ${recentFragments.length} fragments: "${combined.slice(0, 100)}"`);
+    }
+    return combined || latestTranscript;
+  } catch {
+    return latestTranscript;
+  }
+}
+
 // ── Shared AI analysis pipeline ───────────────────────────────
 // Called from both /api/transcription (conference speech) and
 // /api/twilio/ivr-query (IVR-captured user query).
@@ -219,10 +254,13 @@ async function runAnalysisPipeline(callId, transcript) {
     const customerName  = callData?.customer_name || null;
     const customerPhone = callData?.customer_phone || null;
 
-    const searchQuery = customerName ? `${customerName} ${transcript}` : transcript;
+    // Combine recent STT fragments so the AI understands the full sentence
+    const fullTranscript = await getCombinedUserTranscript(callId, transcript);
+
+    const searchQuery = customerName ? `${customerName} ${fullTranscript}` : fullTranscript;
 
     const [analysisResult, embedding] = await Promise.all([
-      analyzeCustomerSpeech(transcript, tier),
+      analyzeCustomerSpeech(fullTranscript, tier),
       generateEmbedding(searchQuery).catch(() => null),
     ]);
 
@@ -259,11 +297,11 @@ async function runAnalysisPipeline(callId, transcript) {
       else console.log(`[analysis] no billing context found for ${customerName || customerPhone}`);
 
       const customerData   = { name: customerName, tier, billingContext };
-      const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
+      // Use the full combined transcript so the reply addresses the complete thought
+      const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion);
       console.log(`[analysis] suggested reply generated: "${(suggestedReply || "").slice(0, 80)}"`);
 
       if (suggestedReply) {
-        // Prefer updating by specific analysis row id; fall back to call_id if insert didn't return id
         const analysisId = savedRows?.[0]?.id;
         const updateQuery = analysisId
           ? supabase.from("analysis").update({ suggested_reply: suggestedReply }).eq("id", analysisId)
@@ -348,14 +386,33 @@ app.post("/api/twilio/voice", async (req, res) => {
     const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
     const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
 
-    const greeting = customer?.name
-      ? `Hi ${escapeXml(customer.name)}, thank you for calling customer support. `
-      : "Thank you for calling customer support. ";
+    // Generate AI greeting suggestion so it's ready when the agent connects
+    if (customer?.name) {
+      generateGreeting(customer.name, customer.tier || "Regular")
+        .then(async (greetingText) => {
+          if (!greetingText) return;
+          const { error } = await supabase.from("analysis").insert({
+            call_id:           callId,
+            emotion:           "calm",
+            intent:            "call_greeting",
+            priority:          "low",
+            suggested_actions: [
+              "Greet the customer warmly by name",
+              "Confirm their identity if needed",
+              "Ask how you can help today",
+            ],
+            suggested_reply: greetingText,
+          });
+          if (error) console.error("[voice] Greeting suggestion error:", error.message);
+          else console.log("[voice] Greeting suggestion saved ✓");
+        })
+        .catch((err) => console.error("[voice] Greeting generation failed:", err.message));
+    }
 
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
-    <Say voice="alice">${greeting}For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+    <Say voice="alice">For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -818,6 +875,15 @@ app.use((err, _req, res, _next) => {
     return res.status(400).json({ error: err.message });
   }
   res.status(500).json({ error: "Unexpected error." });
+});
+
+// -- Mute / unmute agent leg ----------------------------------
+// Actual muting is done client-side via Twilio Voice SDK call.mute().
+// This endpoint exists as a logging hook and for server-side enforcement.
+app.post("/api/call/mute", (req, res) => {
+  const { callId, muted } = req.body;
+  console.log(`[mute] callId=${callId || "n/a"} muted=${muted}`);
+  res.json({ success: true, muted: Boolean(muted) });
 });
 
 // -- Customer details -----------------------------------------
