@@ -241,7 +241,7 @@ async function runAnalysisPipeline(callId, transcript) {
       .select("id");
 
     if (insertErr) console.error("[analysis] Insert error:", insertErr.message);
-    else console.log("[analysis] Basic analysis saved ✓");
+    else console.log("[analysis] Basic analysis saved ✓", savedRows?.[0]?.id ? `id=${savedRows[0].id}` : "(no id returned)");
 
     supabase.from("calls").update({ priority: analysisResult.priority })
       .eq("id", callId)
@@ -256,19 +256,25 @@ async function runAnalysisPipeline(callId, transcript) {
 
       const billingContext = [billsTableCtx, kbBillingCtx].filter(Boolean).join("\n") || null;
       if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
+      else console.log(`[analysis] no billing context found for ${customerName || customerPhone}`);
 
       const customerData   = { name: customerName, tier, billingContext };
       const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
+      console.log(`[analysis] suggested reply generated: "${(suggestedReply || "").slice(0, 80)}"`);
 
-      const analysisId = savedRows?.[0]?.id;
-      if (analysisId && suggestedReply) {
-        supabase.from("analysis")
-          .update({ suggested_reply: suggestedReply })
-          .eq("id", analysisId)
-          .then(({ error }) => {
-            if (error) console.error("[analysis] Reply update error:", error.message);
-            else console.log("[analysis] Suggested reply saved ✓");
-          });
+      if (suggestedReply) {
+        // Prefer updating by specific analysis row id; fall back to call_id if insert didn't return id
+        const analysisId = savedRows?.[0]?.id;
+        const updateQuery = analysisId
+          ? supabase.from("analysis").update({ suggested_reply: suggestedReply }).eq("id", analysisId)
+          : supabase.from("analysis").update({ suggested_reply: suggestedReply }).eq("call_id", callId);
+
+        updateQuery.then(({ error }) => {
+          if (error) console.error("[analysis] Reply update error:", error.message);
+          else console.log("[analysis] Suggested reply saved ✓");
+        });
+      } else {
+        console.warn("[analysis] generateSuggestedReply returned empty string");
       }
     } catch (replyErr) {
       console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
@@ -342,10 +348,14 @@ app.post("/api/twilio/voice", async (req, res) => {
     const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
     const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
 
+    const greeting = customer?.name
+      ? `Hi ${escapeXml(customer.name)}, thank you for calling customer support. `
+      : "Thank you for calling customer support. ";
+
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
-    <Say voice="alice">For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+    <Say voice="alice">${greeting}For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
