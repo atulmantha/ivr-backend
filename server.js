@@ -9,6 +9,9 @@
 //   CORS_ORIGIN, PORT
 // =============================================================
 
+const GEMINI_GENERATE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
+
 const express  = require("express");
 const http     = require("http");
 const { randomUUID } = require("crypto");
@@ -885,6 +888,83 @@ app.post("/api/call/mute", (req, res) => {
   const { callId, muted } = req.body;
   console.log(`[mute] callId=${callId || "n/a"} muted=${muted}`);
   res.json({ success: true, muted: Boolean(muted) });
+});
+
+// -- Call summary: AI-generated summary of the conversation ---
+app.get("/api/call-summary", async (req, res) => {
+  const callId = String(req.query.call_id || "").trim();
+  if (!callId) return res.status(400).json({ error: "call_id required" });
+
+  try {
+    const [{ data: msgs }, { data: analyses }] = await Promise.all([
+      supabase.from("messages").select("role,content,created_at").eq("call_id", callId).order("created_at", { ascending: true }),
+      supabase.from("analysis").select("*").eq("call_id", callId).order("created_at", { ascending: true }),
+    ]);
+
+    const allMsgs     = msgs     || [];
+    const allAnalyses = (analyses || []).filter((a) => a.intent !== "call_greeting");
+    const latest      = allAnalyses[allAnalyses.length - 1] || null;
+    const customerCt  = allMsgs.filter((m) => m.role === "user").length;
+    const agentCt     = allMsgs.filter((m) => m.role === "agent").length;
+
+    const base = {
+      emotion:       latest?.emotion  || "calm",
+      intent:        latest?.intent   || "general_inquiry",
+      priority:      latest?.priority || "low",
+      message_count: { customer: customerCt, agent: agentCt },
+    };
+
+    if (allMsgs.length === 0) {
+      return res.json({ ...base, topic: "Awaiting customer", summary: null, key_points: [], status: "pending" });
+    }
+
+    const transcript = allMsgs
+      .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
+      .join("\n");
+
+    const prompt = [
+      "You are summarizing a call center conversation for an agent dashboard.",
+      "",
+      "Conversation transcript:",
+      transcript,
+      "",
+      latest ? `Most recent analysis — emotion: ${latest.emotion}, intent: ${latest.intent}, priority: ${latest.priority}` : "",
+      "",
+      "Return ONLY valid JSON — no markdown, no code blocks:",
+      JSON.stringify({
+        topic:      "<2-6 word label for the main issue, e.g. 'High electricity bill inquiry'>",
+        summary:    "<2-3 sentences describing what the call is about and what has been established>",
+        key_points: ["<key fact 1 e.g. specific amount or date>", "<key fact 2>", "<key fact 3>"],
+        status:     "<in_progress|resolved|escalated|pending>",
+      }),
+    ].filter(Boolean).join("\n");
+
+    const key      = process.env.GEMINI_API_KEY;
+    const gRes     = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        contents:         [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0.2 },
+      }),
+    });
+
+    if (!gRes.ok) throw new Error(`Gemini ${gRes.status}`);
+    const gData  = await gRes.json();
+    const raw    = gData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
+
+    return res.json({
+      ...base,
+      topic:      parsed.topic      || base.intent,
+      summary:    parsed.summary    || null,
+      key_points: Array.isArray(parsed.key_points) ? parsed.key_points.filter(Boolean) : [],
+      status:     parsed.status     || "in_progress",
+    });
+  } catch (err) {
+    console.error("[call-summary] error:", err.message);
+    return res.status(500).json({ error: "Failed to generate summary." });
+  }
 });
 
 // -- Customer details -----------------------------------------
