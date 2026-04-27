@@ -259,10 +259,19 @@ async function runAnalysisPipeline(callId, transcript) {
 
     const searchQuery = customerName ? `${customerName} ${fullTranscript}` : fullTranscript;
 
-    const [analysisResult, embedding] = await Promise.all([
-      analyzeCustomerSpeech(fullTranscript, tier),
+    // Fetch embedding + billing context in parallel so analysis can use real bill data
+    const [embedding, billsTableCtx, kbBillingCtx] = await Promise.all([
       generateEmbedding(searchQuery).catch(() => null),
+      fetchCustomerBillingContext(null, customerPhone, customerName),
+      fetchBillingFromKnowledgeBase(customerName),
     ]);
+
+    const billingContext = [billsTableCtx, kbBillingCtx].filter(Boolean).join("\n") || null;
+    if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
+    else console.log(`[analysis] no billing context found for ${customerName || customerPhone}`);
+
+    // Pass billing context into analysis so suggested_actions are resolution-focused, not discovery-focused
+    const analysisResult = await analyzeCustomerSpeech(fullTranscript, tier, billingContext);
 
     console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
 
@@ -286,15 +295,7 @@ async function runAnalysisPipeline(callId, transcript) {
       .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); });
 
     try {
-      const [contextChunks, billsTableCtx, kbBillingCtx] = await Promise.all([
-        embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
-        fetchCustomerBillingContext(null, customerPhone, customerName),
-        fetchBillingFromKnowledgeBase(customerName),
-      ]);
-
-      const billingContext = [billsTableCtx, kbBillingCtx].filter(Boolean).join("\n") || null;
-      if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
-      else console.log(`[analysis] no billing context found for ${customerName || customerPhone}`);
+      const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
 
       const customerData   = { name: customerName, tier, billingContext };
       // Use the full combined transcript so the reply addresses the complete thought
