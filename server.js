@@ -136,6 +136,7 @@ async function lookupCustomerByPhone(rawPhone) {
 // Final transcripts are POSTed to /api/transcription by Twilio.
 function customerConferenceTwiml(callId) {
   const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  // Only listen for conference-end here (disconnect tracking); recording is triggered by agent join.
   const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
   const room             = `room-${callId}`;
   console.log(`[twiml] Transcription callback: ${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
@@ -151,7 +152,7 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="join end"
+                statusCallbackEvent="end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
       ${room}
@@ -162,7 +163,8 @@ function customerConferenceTwiml(callId) {
 
 function agentConferenceTwiml(callId) {
   const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  // role=agent tells the handler to start recording when this join event fires.
+  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=agent`);
   const room             = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -639,6 +641,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
 
   // Put agent into the conference room with transcription
   const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  // end event tracks disconnect; role=agent is not used for recording on outbound (customer join triggers it).
   const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -651,7 +654,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="join end"
+                statusCallbackEvent="end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
       ${room}
@@ -669,7 +672,8 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 
   const room                     = `room-${callId}`;
   const customerTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
-  const statusUrl                = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  // role=customer tells the handler to start recording when the outbound customer picks up.
+  const statusUrl                = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=customer`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -689,20 +693,29 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 </Response>`);
 });
 
-// -- Conference status callback (participant-join → start recording; conference-end → disconnect) -
+// -- Conference status callback (join → start recording; end → disconnect) ---
+// role=agent  in URL → fired when inbound agent joins  → start recording
+// role=customer in URL → fired when outbound customer joins → start recording
+// no role (or end event) → conference-end → mark call disconnected
 app.post("/api/conference-status", (req, res) => {
   res.status(200).end();
 
   const callId        = String(req.query.call_id || "").trim();
+  const role          = String(req.query.role    || "").trim(); // "agent" | "customer" | ""
   const event         = req.body.StatusCallbackEvent;
   const conferenceSid = req.body.ConferenceSid;
-  const count         = parseInt(req.body.ParticipantCount || "0", 10);
 
-  console.log(`[conference-status] event=${event} callId=${callId} count=${count} confSid=${conferenceSid}`);
+  console.log(`[conference-status] event=${event} role=${role} callId=${callId} confSid=${conferenceSid}`);
 
-  // Start recording when the second participant joins (agent + customer both connected).
-  // This fires from all four Conference elements so the dedup check prevents double-recording.
-  if (event === "participant-join" && count >= 2 && conferenceSid && callId && twilioClient) {
+  // Trigger recording on the join that signals both parties are connected:
+  //   inbound:  agent joins  (customer was already in the conference waiting)
+  //   outbound: customer joins (agent was already in the conference waiting)
+  const shouldRecord =
+    event === "participant-join" &&
+    (role === "agent" || role === "customer") &&
+    conferenceSid && callId && twilioClient;
+
+  if (shouldRecord) {
     (async () => {
       try {
         const { data: existing } = await supabase
