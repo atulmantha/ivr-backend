@@ -102,6 +102,24 @@ LANGUAGE sql STABLE AS $$
   LIMIT match_count;
 $$;
 
+-- recordings (linked to a call; one recording per agent session)
+CREATE TABLE IF NOT EXISTS recordings (
+  id               UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  call_id          UUID        REFERENCES calls(id) ON DELETE CASCADE,
+  recording_sid    TEXT        UNIQUE,
+  conference_sid   TEXT,
+  call_type        TEXT        DEFAULT 'inbound',
+  status           TEXT        DEFAULT 'pending',
+  recording_url    TEXT,
+  duration_seconds INTEGER,
+  started_at       TIMESTAMPTZ DEFAULT NOW(),
+  ended_at         TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Add call_type to calls (inbound vs outbound)
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_type TEXT DEFAULT 'inbound';
+
 -- Disable RLS (internal tool — prevents empty realtime payloads)
 ALTER TABLE customers      DISABLE ROW LEVEL SECURITY;
 ALTER TABLE bills          DISABLE ROW LEVEL SECURITY;
@@ -109,6 +127,7 @@ ALTER TABLE calls          DISABLE ROW LEVEL SECURITY;
 ALTER TABLE messages       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE analysis       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE knowledge_base DISABLE ROW LEVEL SECURITY;
+ALTER TABLE recordings     DISABLE ROW LEVEL SECURITY;
 
 -- Enable Realtime (errors ignored if already added)
 DO $$
@@ -121,6 +140,9 @@ BEGIN
   EXCEPTION WHEN others THEN NULL; END;
   BEGIN
     ALTER PUBLICATION supabase_realtime ADD TABLE analysis;
+  EXCEPTION WHEN others THEN NULL; END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE recordings;
   EXCEPTION WHEN others THEN NULL; END;
 END $$;
 `;
