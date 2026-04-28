@@ -151,7 +151,7 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="participant-join end"
+                statusCallbackEvent="join end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
       ${room}
@@ -174,7 +174,7 @@ function agentConferenceTwiml(callId) {
   </Start>
   <Dial>
     <Conference beep="false" waitUrl=""
-                statusCallbackEvent="participant-join"
+                statusCallbackEvent="join"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
       ${room}
@@ -385,12 +385,11 @@ app.post("/api/twilio/voice", async (req, res) => {
       customer_name:  customer?.name  || null,
       tier:           customer?.tier  || null,
       priority:       "low",
-      call_type:      "inbound",
     }).then(({ error }) => {
       if (error) { console.error("[voice] Call insert error:", error.message); return; }
       console.log(`[voice] Call inserted in DB ✓`);
-      // Best-effort status update (silent if column not yet migrated)
-      supabase.from("calls").update({ status: "ivr" }).eq("id", callId).then(() => {});
+      // Best-effort column updates (silent if columns not yet migrated)
+      supabase.from("calls").update({ status: "ivr", call_type: "inbound" }).eq("id", callId).then(() => {});
     });
 
     const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
@@ -616,10 +615,12 @@ app.post("/api/twilio/outbound", async (req, res) => {
     customer_name:  null,
     tier:           null,
     priority:       "low",
-    call_type:      "outbound",
   }).then(({ error }) => {
     if (error) console.error("[outbound] Call insert error:", error.message);
-    else console.log(`[outbound] Call inserted in DB ✓`);
+    else {
+      console.log(`[outbound] Call inserted in DB ✓`);
+      supabase.from("calls").update({ call_type: "outbound" }).eq("id", callId).then(() => {});
+    }
   });
 
   lookupCustomerByPhone(to).then((customer) => {
@@ -650,7 +651,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="participant-join end"
+                statusCallbackEvent="join end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
       ${room}
@@ -679,7 +680,7 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
   </Start>
   <Dial>
     <Conference beep="false" waitUrl=""
-                statusCallbackEvent="participant-join"
+                statusCallbackEvent="join"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
       ${room}
