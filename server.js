@@ -413,8 +413,8 @@ app.post("/api/twilio/voice", async (req, res) => {
       supabase.from("calls").update({ status: "ivr", call_type: "inbound" }).eq("id", callId).then(() => {});
     });
 
-    const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
-    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
+    const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=1`);
 
     // Generate AI greeting suggestion so it's ready when the agent connects
     if (customer?.name) {
@@ -441,8 +441,8 @@ app.post("/api/twilio/voice", async (req, res) => {
 
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
-    <Say voice="alice">For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+  <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
+    <Say voice="alice">Welcome! To verify your identity, please say your date of birth. For example, say January first, two thousand.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -452,6 +452,27 @@ app.post("/api/twilio/voice", async (req, res) => {
     // Fallback: skip IVR and connect directly
     res.send(customerConferenceTwiml(callId));
   }
+});
+
+// -- IVR: DOB verification ------------------------------------
+// POC: accepts any spoken DOB — reference default is January 1, 2000.
+// On success, plays the main menu.
+app.post("/api/twilio/ivr-verify", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const callId = String(req.query.call_id || "").trim();
+  const speech = String(req.body.SpeechResult || "").trim();
+  console.log(`[ivr-verify] callId=${callId} dob="${speech.slice(0, 50)}"`);
+
+  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
+  const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
+    <Say voice="alice">Thank you, your identity has been verified. For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
 });
 
 // -- IVR: menu selection handler ------------------------------
@@ -1071,38 +1092,74 @@ app.get("/api/call-summary", async (req, res) => {
       message_count: { customer: customerCt, agent: agentCt },
     };
 
-    if (allMsgs.length === 0) {
-      return res.json({ ...base, topic: "Awaiting customer", summary: null, key_points: [], status: "pending" });
-    }
+    const empty = {
+      ...base,
+      topic: "Awaiting customer", summary: null,
+      key_points: [], customer_insights: [], rep_insights: [], pending_items: [],
+      overall_sentiment: "neutral", sentiment_timeline: [], agent_attributes: null,
+      status: "pending",
+    };
 
-    const transcript = allMsgs
-      .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
-      .join("\n");
+    if (allMsgs.length === 0) return res.json(empty);
 
-    const prompt = [
-      "You are summarizing a call center conversation for an agent dashboard.",
-      "",
-      "Conversation transcript:",
-      transcript,
-      "",
-      latest ? `Most recent analysis — emotion: ${latest.emotion}, intent: ${latest.intent}, priority: ${latest.priority}` : "",
-      "",
-      "Return ONLY valid JSON — no markdown, no code blocks:",
-      JSON.stringify({
-        topic:      "<2-6 word label for the main issue, e.g. 'High electricity bill inquiry'>",
-        summary:    "<2-3 sentences describing what the call is about and what has been established>",
-        key_points: ["<key fact 1 e.g. specific amount or date>", "<key fact 2>", "<key fact 3>"],
-        status:     "<in_progress|resolved|escalated|pending>",
-      }),
-    ].filter(Boolean).join("\n");
+    // Build transcript with per-message relative timestamps (minutes from first message)
+    const callStartMs = new Date(allMsgs[0].created_at).getTime();
+    const transcriptWithTimes = allMsgs.map((m) => {
+      const min = Math.floor((new Date(m.created_at).getTime() - callStartMs) / 60_000);
+      return `[${min}m] ${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`;
+    }).join("\n");
 
-    const key      = process.env.GEMINI_API_KEY;
-    const gRes     = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+    const callDurationMin = allMsgs.length > 1
+      ? Math.ceil((new Date(allMsgs[allMsgs.length - 1].created_at).getTime() - callStartMs) / 60_000)
+      : 0;
+
+    const prompt = `You are summarizing a call center conversation for an agent dashboard.
+
+Transcript (timestamps are minutes from call start):
+${transcriptWithTimes}
+${latest ? `\nLast detected: emotion=${latest.emotion}, intent=${latest.intent}, priority=${latest.priority}` : ""}
+
+Return ONLY valid JSON, no markdown, no code fences. Use exactly this structure:
+{
+  "topic": "2-6 word label for the main issue",
+  "summary": "2-3 sentences describing what happened on the call",
+  "key_points": ["specific fact or figure mentioned", "another key fact"],
+  "status": "in_progress|resolved|escalated|pending",
+  "customer_insights": ["what the customer wanted or discussed — bullet 1", "bullet 2", "bullet 3"],
+  "rep_insights": ["what the agent/rep provided or said — bullet 1", "bullet 2", "bullet 3"],
+  "pending_items": ["topic or question the rep did NOT address or resolve — bullet 1", "bullet 2"],
+  "overall_sentiment": "positive|neutral|negative",
+  "sentiment_timeline": [
+    {"minute": 0, "score": 0.7, "emotion": "calm"}
+  ],
+  "agent_attributes": {
+    "audio_pause": true,
+    "audio_speed": true,
+    "respect": true,
+    "empathy": true,
+    "politeness": true,
+    "clarity": true,
+    "confidence": true,
+    "engagement": true,
+    "professionalism": true,
+    "patience": true,
+    "knowledge": false
+  }
+}
+
+Rules:
+- sentiment_timeline: one entry per minute from 0 to ${callDurationMin}. score is 0.0 (very angry) to 1.0 (very happy/satisfied). emotion is one of: calm, frustrated, confused, angry, satisfied.
+- agent_attributes: evaluate each attribute based solely on agent messages. If no agent messages exist, set all to null.
+- customer_insights / rep_insights / pending_items: 2-4 concise bullet points each. If no agent was present, rep_insights = [] and pending_items = ["Agent not yet joined"].
+`;
+
+    const key  = process.env.GEMINI_API_KEY;
+    const gRes = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify({
         contents:         [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 300, temperature: 0.2 },
+        generationConfig: { maxOutputTokens: 1000, temperature: 0.2 },
       }),
     });
 
@@ -1113,10 +1170,16 @@ app.get("/api/call-summary", async (req, res) => {
 
     return res.json({
       ...base,
-      topic:      parsed.topic      || base.intent,
-      summary:    parsed.summary    || null,
-      key_points: Array.isArray(parsed.key_points) ? parsed.key_points.filter(Boolean) : [],
-      status:     parsed.status     || "in_progress",
+      topic:              parsed.topic              || base.intent,
+      summary:            parsed.summary            || null,
+      key_points:         Array.isArray(parsed.key_points)         ? parsed.key_points.filter(Boolean)         : [],
+      status:             parsed.status             || "in_progress",
+      customer_insights:  Array.isArray(parsed.customer_insights)  ? parsed.customer_insights.filter(Boolean)  : [],
+      rep_insights:       Array.isArray(parsed.rep_insights)       ? parsed.rep_insights.filter(Boolean)       : [],
+      pending_items:      Array.isArray(parsed.pending_items)      ? parsed.pending_items.filter(Boolean)      : [],
+      overall_sentiment:  parsed.overall_sentiment  || "neutral",
+      sentiment_timeline: Array.isArray(parsed.sentiment_timeline) ? parsed.sentiment_timeline                 : [],
+      agent_attributes:   parsed.agent_attributes   || null,
     });
   } catch (err) {
     console.error("[call-summary] error:", err.message);
