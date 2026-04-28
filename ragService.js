@@ -138,14 +138,22 @@ async function generateSuggestedReply(
   ].filter((line) => line !== "").join("\n");
 
   const key = process.env.GEMINI_API_KEY;
-  const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 200, temperature: 0.2 },
-    }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  let res;
+  try {
+    res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 200, temperature: 0.2 },
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) throw new Error(`Gemini API ${res.status}`);
   const data = await res.json();
