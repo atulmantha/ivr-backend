@@ -234,7 +234,7 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
 
     if (!data || data.length === 0) return latestTranscript;
 
-    const WINDOW_MS = 45_000; // 45 seconds — covers typical STT lag
+    const WINDOW_MS = 10_000; // 10 seconds — covers typical STT lag
     const latestTime = new Date(data[0].created_at).getTime();
 
     const recentFragments = data
@@ -258,6 +258,25 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
 // /api/twilio/ivr-query (IVR-captured user query).
 async function runAnalysisPipeline(callId, transcript) {
   try {
+    // Deduplicate: skip if another pipeline ran for this call within the last 12 seconds.
+    // Multiple rapid STT fragments would otherwise each trigger separate Gemini calls,
+    // exhausting the free-tier rate limit (15 RPM) before any reply is generated.
+    const { data: recentRow } = await supabase
+      .from("analysis")
+      .select("created_at")
+      .eq("call_id", callId)
+      .neq("intent", "call_greeting")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (recentRow) {
+      const ageMs = Date.now() - new Date(recentRow.created_at).getTime();
+      if (ageMs < 12_000) {
+        console.log(`[analysis] Skipping pipeline — last run was ${ageMs}ms ago (< 12s)`);
+        return;
+      }
+    }
+
     const { data: callData } = await supabase
       .from("calls").select("*").eq("id", callId).maybeSingle();
     const tier          = callData?.tier          || "Regular";
