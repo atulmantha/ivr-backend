@@ -1271,7 +1271,18 @@ app.post("/api/call/mute", (req, res) => {
 // -- Call summary: AI-generated summary of the conversation ---
 app.get("/api/call-summary", async (req, res) => {
   const callId = String(req.query.call_id || "").trim();
+  const force  = req.query.force === "true";
   if (!callId) return res.status(400).json({ error: "call_id required" });
+
+  // Return cached AI summary immediately unless the caller forced a refresh
+  if (!force) {
+    const { data: callRow } = await supabase
+      .from("calls").select("summary_json").eq("id", callId).maybeSingle();
+    if (callRow?.summary_json) {
+      console.log(`[call-summary] Returning cached summary for callId=${callId}`);
+      return res.json(callRow.summary_json);
+    }
+  }
 
   try {
     const [{ data: msgs }, { data: analyses }] = await Promise.all([
@@ -1375,6 +1386,25 @@ Rules:
       const gData = await gRes.json();
       const raw   = gData.candidates?.[0]?.content?.parts?.[0]?.text || "";
       parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
+      // Cache the successful Gemini response so future loads are instant
+      const toCache = {
+        ...base,
+        topic:              parsed.topic              || base.intent,
+        summary:            parsed.summary            || null,
+        key_points:         Array.isArray(parsed.key_points)         ? parsed.key_points.filter(Boolean)         : [],
+        status:             parsed.status             || "in_progress",
+        customer_insights:  Array.isArray(parsed.customer_insights)  ? parsed.customer_insights.filter(Boolean)  : [],
+        rep_insights:       Array.isArray(parsed.rep_insights)       ? parsed.rep_insights.filter(Boolean)       : [],
+        pending_items:      Array.isArray(parsed.pending_items)      ? parsed.pending_items.filter(Boolean)      : [],
+        overall_sentiment:  parsed.overall_sentiment  || "neutral",
+        sentiment_timeline: Array.isArray(parsed.sentiment_timeline) ? parsed.sentiment_timeline                 : [],
+        agent_attributes:   parsed.agent_attributes   || null,
+      };
+      supabase.from("calls").update({ summary_json: toCache }).eq("id", callId)
+        .then(({ error }) => {
+          if (error) console.error("[call-summary] Cache save error:", error.message);
+          else console.log(`[call-summary] Summary cached for callId=${callId}`);
+        });
     } catch (geminiErr) {
       console.error("[call-summary] Gemini error (returning base data):", geminiErr.message);
     }
