@@ -120,6 +120,18 @@ CREATE TABLE IF NOT EXISTS recordings (
 -- Add call_type to calls (inbound vs outbound)
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_type TEXT DEFAULT 'inbound';
 
+-- agents (authenticated call center agents)
+CREATE TABLE IF NOT EXISTS agents (
+  id           UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  auth_user_id UUID        UNIQUE NOT NULL,
+  agent_id     TEXT        UNIQUE NOT NULL,
+  name         TEXT        NOT NULL,
+  email        TEXT        NOT NULL,
+  department   TEXT        NOT NULL DEFAULT 'General',
+  is_verified  BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Disable RLS (internal tool — prevents empty realtime payloads)
 ALTER TABLE customers      DISABLE ROW LEVEL SECURITY;
 ALTER TABLE bills          DISABLE ROW LEVEL SECURITY;
@@ -128,6 +140,7 @@ ALTER TABLE messages       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE analysis       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE knowledge_base DISABLE ROW LEVEL SECURITY;
 ALTER TABLE recordings     DISABLE ROW LEVEL SECURITY;
+ALTER TABLE agents         DISABLE ROW LEVEL SECURITY;
 
 -- Enable Realtime (errors ignored if already added)
 DO $$
