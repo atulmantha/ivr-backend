@@ -373,6 +373,44 @@ function departmentToAgentIdentity(department) {
   return map[department] || "agent_general";
 }
 
+// Maps the IVR category chosen by the customer to the Twilio
+// client identity of the correct department agent pool.
+function categoryToAgentIdentity(category) {
+  const map = {
+    billing:   "agent_billing",
+    new_lines: "agent_support",
+    service:   "agent_support",
+    general:   "agent_general",
+  };
+  return map[category] || "agent_general";
+}
+
+// Redirects every participant in a waiting conference to the
+// "no agents available" TwiML endpoint.
+async function redirectCustomerToNoAgentMessage(callId) {
+  if (!twilioClient) return;
+  try {
+    const conferences = await twilioClient.conferences.list({
+      friendlyName: `room-${callId}`,
+      status: "in-progress",
+      limit: 1,
+    });
+    if (!conferences.length) return;
+    const participants = await twilioClient
+      .conferences(conferences[0].sid)
+      .participants.list({ limit: 20 });
+    for (const p of participants) {
+      await twilioClient.calls(p.callSid).update({
+        url:    `${BASE_URL}/api/twilio/no-agent-available`,
+        method: "POST",
+      });
+    }
+    console.log(`[no-agent] Customer redirected for callId=${callId}`);
+  } catch (err) {
+    console.error("[no-agent] Redirect error:", err.message);
+  }
+}
+
 // -- Twilio Access Token for agent browser softphone ----------
 // Accepts an optional Bearer token (Supabase JWT) to derive the agent's
 // department and assign the correct Twilio client identity.
@@ -537,8 +575,10 @@ app.post("/api/twilio/ivr-menu", async (req, res) => {
     category = "new_lines";    categoryLabel = "New Lines and Services";
   } else if (digits === "3" || /service|technical|issue|problem|not working|outage|slow|broken/i.test(speech)) {
     category = "service";      categoryLabel = "Service Support";
+  } else if (digits === "4" || /general|other|help|anything/i.test(speech)) {
+    category = "general";      categoryLabel = "General Inquiries";
   } else {
-    category = "general";      categoryLabel = "Support";
+    category = "general";      categoryLabel = "General Inquiries";
   }
 
   if (callId) {
@@ -591,16 +631,22 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
       .then(({ error }) => { if (error) console.error("[ivr-query] Call update:", error.message); });
   }
 
-  // Dial the agent browser now that the customer is ready to talk
+  // Dial the agent browser now that the customer is ready to talk.
+  // Routes to the department pool that matches the customer's IVR choice.
   if (twilioClient && TWILIO_PHONE_NUMBER && callId) {
-    const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-    console.log(`[ivr-query] Dialling agent → client:agent`);
+    const agentIdentity = categoryToAgentIdentity(category);
+    const agentUrl      = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    console.log(`[ivr-query] Dialling agent → client:${agentIdentity} (category=${category})`);
     twilioClient.calls.create({
-      to:   "client:agent",
+      to:   `client:${agentIdentity}`,
       from: TWILIO_PHONE_NUMBER,
       url:  agentUrl,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}`,
+      statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+      statusCallbackMethod: "POST",
+      timeout: 8,
     }).then((call) => {
-      console.log(`[ivr-query] Agent call created ✓ SID=${call.sid}`);
+      console.log(`[ivr-query] Agent call created ✓ SID=${call.sid} identity=${agentIdentity}`);
     }).catch((err) => {
       console.error(`[ivr-query] Agent dial FAILED: ${err.message}`);
     });
@@ -773,6 +819,86 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
       ${room}
     </Conference>
   </Dial>
+</Response>`);
+});
+
+// -- Agent dial status callback (fired when agent call ends/fails) -
+// Handles no-answer/busy/failed by first trying the general pool,
+// then redirecting the waiting customer if still no one picks up.
+app.post("/api/twilio/agent-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const identity = String(req.query.identity || "").trim();
+  const status   = String(req.body.CallStatus || "").trim();
+
+  console.log(`[agent-status] callId=${callId} identity=${identity} status=${status}`);
+
+  if (!callId || !twilioClient) return;
+  if (!["no-answer", "busy", "failed"].includes(status)) return;
+
+  if (identity !== "agent_general") {
+    // First failure — try the general pool as a fallback
+    console.log(`[agent-status] No answer from ${identity} — trying agent_general`);
+    const fallbackUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    twilioClient.calls.create({
+      to:   "client:agent_general",
+      from: TWILIO_PHONE_NUMBER,
+      url:  fallbackUrl,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=agent_general`,
+      statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+      statusCallbackMethod: "POST",
+      timeout: 8,
+    }).then((call) => {
+      console.log(`[agent-status] Fallback agent call created ✓ SID=${call.sid}`);
+    }).catch((err) => {
+      console.error(`[agent-status] Fallback dial FAILED: ${err.message}`);
+      redirectCustomerToNoAgentMessage(callId);
+    });
+  } else {
+    // General pool also failed — no agents available at all
+    console.log(`[agent-status] No agents available — redirecting customer callId=${callId}`);
+    redirectCustomerToNoAgentMessage(callId);
+  }
+});
+
+// -- Twilio recording-status webhook (fires when Twilio recording completes) --
+app.post("/api/twilio/recording-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId       = String(req.query.call_id            || "").trim();
+  const sid          = String(req.body.RecordingSid         || "").trim();
+  const status       = String(req.body.RecordingStatus      || "").trim();
+  const duration     = parseInt(req.body.RecordingDuration  || "0", 10);
+  const recordingUrl = String(req.body.RecordingUrl         || "").trim();
+
+  if (!callId || !sid) {
+    console.warn("[recording-status/twilio] Missing callId or RecordingSid — ignoring");
+    return;
+  }
+
+  console.log(`[recording-status/twilio] callId=${callId} sid=${sid} status=${status} duration=${isNaN(duration) ? "?" : duration}s`);
+
+  const { error } = await supabase.from("recordings").upsert({
+    call_id:          callId,
+    recording_sid:    sid,
+    recording_url:    recordingUrl || null,
+    duration_seconds: isNaN(duration) ? null : duration,
+    status,
+    completed_at:     status === "completed" ? new Date().toISOString() : null,
+  }, { onConflict: "recording_sid" });
+
+  if (error) console.error("[recording-status/twilio] Save error:", error.message);
+  else console.log(`[recording-status/twilio] ${status} recording saved ✓ sid=${sid}`);
+});
+
+// -- No-agent TwiML (played to customer when no agent answers) -
+app.post("/api/twilio/no-agent-available", (_req, res) => {
+  res.set("Content-Type", "text/xml");
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We are sorry, but all agents are currently unavailable. Please call back during business hours or visit our website for assistance. Thank you for calling BrightSuite.</Say>
+  <Hangup/>
 </Response>`);
 });
 
