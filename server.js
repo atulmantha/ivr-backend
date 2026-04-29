@@ -524,7 +524,7 @@ app.post("/api/twilio/voice", async (req, res) => {
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Welcome! To verify your identity, please say your date of birth. For example, say January first, two thousand.</Say>
+    <Say voice="alice">Welcome to BrightSuite! To verify your identity, please say your full name and date of birth. For example, say John Smith, January first, two thousand.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -551,7 +551,7 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
-    <Say voice="alice">Thank you, your identity has been verified. For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+    <Say voice="alice">Thank you, your name and date of birth have been verified. For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -1377,6 +1377,24 @@ Rules:
       parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
     } catch (geminiErr) {
       console.error("[call-summary] Gemini error (returning base data):", geminiErr.message);
+    }
+
+    // Build a fallback summary from the raw transcript when Gemini fails or skips it
+    if (!parsed.summary) {
+      const customerLines = allMsgs.filter((m) => m.role === "user").map((m) => m.content.trim());
+      const agentLines    = allMsgs.filter((m) => m.role === "agent").map((m) => m.content.trim());
+      const topic         = parsed.topic || base.intent.replace(/_/g, " ");
+
+      let fallback = `The customer contacted support regarding ${topic}.`;
+      if (customerLines.length > 0) {
+        fallback += ` The customer said: "${customerLines.slice(0, 2).join(" ")}".`;
+      }
+      if (agentLines.length > 0) {
+        fallback += ` The agent responded: "${agentLines.slice(0, 2).join(" ")}".`;
+      } else {
+        fallback += " The agent has not yet responded on this call.";
+      }
+      parsed.summary = fallback;
     }
 
     return res.json({
