@@ -22,6 +22,7 @@ const { analyzeCustomerSpeech }                            = require("./decision
 const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
 const { runMigrations }                                    = require("./migrate");
+const authRoutes                                           = require("./authRoutes");
 require("dotenv").config({ quiet: true });
 
 // ── App + HTTP server ─────────────────────────────────────────
@@ -36,6 +37,9 @@ const corsOrigin = process.env.CORS_ORIGIN
 app.use(cors({ origin: corsOrigin }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// ── Auth module (independent — does not touch existing routes) ──
+app.use("/api/auth", authRoutes);
 
 // ── Env validation ────────────────────────────────────────────
 const {
@@ -356,10 +360,48 @@ async function runAnalysisPipeline(callId, transcript) {
 
 app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
 
+// Maps the department stored in the agents table to a Twilio client identity,
+// so agents register under the correct pool for department-based routing.
+function departmentToAgentIdentity(department) {
+  const map = {
+    "Billing":           "agent_billing",
+    "Technical Support": "agent_support",
+    "Sales":             "agent_support",
+    "Customer Success":  "agent_support",
+    "General":           "agent_general",
+  };
+  return map[department] || "agent_general";
+}
+
 // -- Twilio Access Token for agent browser softphone ----------
-app.get("/api/token", (_req, res) => {
+// Accepts an optional Bearer token (Supabase JWT) to derive the agent's
+// department and assign the correct Twilio client identity.
+// Falls back to "agent_general" if no auth header is present.
+app.get("/api/token", async (req, res) => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET) {
     return res.status(503).json({ error: "Twilio credentials not configured." });
+  }
+
+  let agentIdentity = "agent_general";
+
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      const bearerToken = authHeader.slice(7);
+      const { data: { user } } = await supabase.auth.getUser(bearerToken);
+      if (user) {
+        const { data: agent } = await supabase
+          .from("agents")
+          .select("department")
+          .eq("auth_user_id", user.id)
+          .single();
+        if (agent?.department) {
+          agentIdentity = departmentToAgentIdentity(agent.department);
+        }
+      }
+    } catch (e) {
+      console.warn("[token] Could not resolve agent department:", e.message);
+    }
   }
 
   const AccessToken = twilio.jwt.AccessToken;
@@ -369,7 +411,7 @@ app.get("/api/token", (_req, res) => {
     TWILIO_ACCOUNT_SID,
     TWILIO_API_KEY,
     TWILIO_API_SECRET,
-    { identity: "agent", ttl: 3600 }
+    { identity: agentIdentity, ttl: 3600 }
   );
 
   const voiceGrant = new VoiceGrant({
@@ -378,7 +420,8 @@ app.get("/api/token", (_req, res) => {
   });
 
   token.addGrant(voiceGrant);
-  return res.json({ token: token.toJwt() });
+  console.log(`[token] Issued Twilio token → identity="${agentIdentity}"`);
+  return res.json({ token: token.toJwt(), identity: agentIdentity });
 });
 
 // -- Customer calls in → IVR greeting + menu -----------------
