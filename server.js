@@ -166,10 +166,9 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  // role=agent tells the handler to start recording when this join event fires.
-  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=agent`);
-  const room             = `room-${callId}`;
+  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
+  const room               = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -180,9 +179,11 @@ function agentConferenceTwiml(callId) {
   </Start>
   <Dial>
     <Conference beep="false" waitUrl=""
-                statusCallbackEvent="join"
-                statusCallback="${statusUrl}"
-                statusCallbackMethod="POST">
+                endConferenceOnExit="true"
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackMethod="POST"
+                recordingStatusCallbackEvent="completed absent">
       ${room}
     </Conference>
   </Dial>
@@ -885,7 +886,7 @@ app.post("/api/twilio/recording-status", async (req, res) => {
     recording_url:    recordingUrl || null,
     duration_seconds: isNaN(duration) ? null : duration,
     status,
-    completed_at:     status === "completed" ? new Date().toISOString() : null,
+    ended_at:         status === "completed" ? new Date().toISOString() : null,
   }, { onConflict: "recording_sid" });
 
   if (error) console.error("[recording-status/twilio] Save error:", error.message);
@@ -971,6 +972,36 @@ app.post("/api/conference-status", (req, res) => {
         if (error) console.error("[conference-status] Status update:", error.message);
         else console.log(`[conference-status] Call ${callId} marked disconnected ✓`);
       });
+
+    // Fallback: if the recordingStatusCallback webhook was missed,
+    // query Twilio directly 90 s after conference ends (enough time for encoding).
+    if (twilioClient && conferenceSid) {
+      setTimeout(async () => {
+        try {
+          console.log(`[recording-sync] Querying Twilio for recordings conferenceSid=${conferenceSid}`);
+          const recs = await twilioClient.recordings.list({ conferenceSid, limit: 10 });
+          if (!recs.length) {
+            console.log(`[recording-sync] No recordings found for conferenceSid=${conferenceSid}`);
+            return;
+          }
+          for (const rec of recs) {
+            const { error } = await supabase.from("recordings").upsert({
+              call_id:          callId,
+              recording_sid:    rec.sid,
+              recording_url:    rec.mediaUrl || null,
+              duration_seconds: rec.duration ? parseInt(String(rec.duration), 10) : null,
+              status:           rec.status,
+              ended_at:         rec.status === "completed" ? new Date().toISOString() : null,
+            }, { onConflict: "recording_sid" });
+            if (error) console.error(`[recording-sync] Upsert error sid=${rec.sid}:`, error.message);
+            else console.log(`[recording-sync] Recording saved ✓ sid=${rec.sid} status=${rec.status}`);
+          }
+        } catch (err) {
+          console.error("[recording-sync] Twilio fetch error:", err.message);
+        }
+      }, 90_000);
+      console.log(`[recording-sync] Scheduled fallback recording sync in 90 s for callId=${callId}`);
+    }
   }
 });
 
@@ -1322,20 +1353,31 @@ Rules:
 - customer_insights / rep_insights / pending_items: 2-4 concise bullet points each. If no agent was present, rep_insights = [] and pending_items = ["Agent not yet joined"].
 `;
 
-    const key  = process.env.GEMINI_API_KEY;
-    const gRes = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({
-        contents:         [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 1000, temperature: 0.2 },
-      }),
-    });
+    const key = process.env.GEMINI_API_KEY;
+    let parsed = {};
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20_000);
+      let gRes;
+      try {
+        gRes = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({
+            contents:         [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 1000, temperature: 0.2 },
+          }),
+          signal: controller.signal,
+        });
+      } finally { clearTimeout(timer); }
 
-    if (!gRes.ok) throw new Error(`Gemini ${gRes.status}`);
-    const gData  = await gRes.json();
-    const raw    = gData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
+      if (!gRes.ok) throw new Error(`Gemini ${gRes.status}`);
+      const gData = await gRes.json();
+      const raw   = gData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
+    } catch (geminiErr) {
+      console.error("[call-summary] Gemini error (returning base data):", geminiErr.message);
+    }
 
     return res.json({
       ...base,
