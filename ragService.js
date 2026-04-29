@@ -1,5 +1,5 @@
 const GEMINI_GENERATE_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 
 const GEMINI_EMBED_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent";
