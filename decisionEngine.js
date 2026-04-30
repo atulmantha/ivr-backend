@@ -2,7 +2,7 @@ const { normalizeEmotion } = require("./emotionService");
 const { normalizeIntent, isHighStakesIntent } = require("./intentService");
 
 const GEMINI_GENERATE_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
 async function geminiGenerate(prompt, maxOutputTokens = 300, temperature = 0.2) {
   const key = process.env.GEMINI_API_KEY;
@@ -11,7 +11,7 @@ async function geminiGenerate(prompt, maxOutputTokens = 300, temperature = 0.2) 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens, temperature },
+      generationConfig: { maxOutputTokens, temperature, thinkingConfig: { thinkingBudget: 0 } },
     }),
   });
   if (!res.ok) throw new Error(`Gemini API ${res.status}`);
