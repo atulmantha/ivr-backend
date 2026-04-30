@@ -92,7 +92,8 @@ async function generateSuggestedReply(
   contextChunks,
   tier = "Regular",
   customerData = null,
-  emotion = "calm"
+  emotion = "calm",
+  conversationHistory = []
 ) {
   const context = contextChunks.length > 0 ? contextChunks.join("\n\n") : null;
 
@@ -114,10 +115,18 @@ async function generateSuggestedReply(
       ].join("\n")
     : "Use a warm, calm, and helpful tone throughout.";
 
+  const historySection = conversationHistory.length > 0
+    ? `Recent conversation (oldest first):\n${conversationHistory
+        .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
+        .join("\n")}`
+    : null;
+
   const prompt = [
     `You are coaching a call center agent handling a ${tier} tier customer.`,
     `Customer emotion: ${emotion}`,
-    `The customer said: "${userInput}"`,
+    "",
+    historySection || "",
+    `The customer's LATEST question: "${userInput}"`,
     "",
     accountSection || "",
     context
@@ -128,6 +137,7 @@ async function generateSuggestedReply(
     "",
     "Write the exact words the agent should say to the customer.",
     "Rules:",
+    "- Answer ONLY the customer's LATEST question above. Do NOT repeat information already given earlier in the conversation.",
     "- Do NOT start with 'Hello', 'Hi', or any greeting — the customer has already been greeted. Go straight to addressing their concern.",
     "- 1-3 short sentences. Voice-friendly — natural spoken language, no jargon.",
     "- If the retrieved data contains specific bill amounts, payment dates, due dates, or account figures, state them explicitly and precisely.",
