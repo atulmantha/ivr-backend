@@ -382,17 +382,16 @@ function departmentToAgentIdentity(department) {
 // client identity of the correct department agent pool.
 function categoryToAgentIdentity(category) {
   const map = {
-    billing:   "agent_billing",
-    new_lines: "agent_support",
-    service:   "agent_support",
-    general:   "agent_general",
+    billing:        "agent_billing",
+    service:        "agent_support",
+    new_connection: "agent_support",
+    general:        "agent_general",
   };
   return map[category] || "agent_general";
 }
 
-// Redirects every participant in a waiting conference to the
-// "no agents available" TwiML endpoint.
-async function redirectCustomerToNoAgentMessage(callId) {
+// Redirects all participants in a live conference to an arbitrary TwiML URL.
+async function redirectCustomerTo(callId, url) {
   if (!twilioClient) return;
   try {
     const conferences = await twilioClient.conferences.list({
@@ -405,15 +404,16 @@ async function redirectCustomerToNoAgentMessage(callId) {
       .conferences(conferences[0].sid)
       .participants.list({ limit: 20 });
     for (const p of participants) {
-      await twilioClient.calls(p.callSid).update({
-        url:    `${BASE_URL}/api/twilio/no-agent-available`,
-        method: "POST",
-      });
+      await twilioClient.calls(p.callSid).update({ url, method: "POST" });
     }
-    console.log(`[no-agent] Customer redirected for callId=${callId}`);
+    console.log(`[redirect] Customer redirected callId=${callId} → ${url}`);
   } catch (err) {
-    console.error("[no-agent] Redirect error:", err.message);
+    console.error("[redirect] Error:", err.message);
   }
+}
+
+function redirectCustomerToNoAgentMessage(callId) {
+  return redirectCustomerTo(callId, `${BASE_URL}/api/twilio/no-agent-available`);
 }
 
 // -- Twilio Access Token for agent browser softphone ----------
@@ -499,7 +499,7 @@ app.post("/api/twilio/voice", async (req, res) => {
       supabase.from("calls").update({ status: "ivr", call_type: "inbound" }).eq("id", callId).then(() => {});
     });
 
-    const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}`);
+    const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}&attempt=1`);
     const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=1`);
 
     // Generate AI greeting suggestion so it's ready when the agent connects
@@ -540,50 +540,126 @@ app.post("/api/twilio/voice", async (req, res) => {
   }
 });
 
-// -- IVR: DOB verification ------------------------------------
-// POC: accepts any spoken DOB — reference default is January 1, 2000.
-// On success, plays the main menu.
+// -- IVR: identity verification (name + DOB) ------------------
+// POC: DOB is fixed to January 1, 2000 for all users.
+// Validates name against the customers table; allows 2 attempts total.
 app.post("/api/twilio/ivr-verify", async (req, res) => {
   res.set("Content-Type", "text/xml");
-  const callId = String(req.query.call_id || "").trim();
-  const speech = String(req.body.SpeechResult || "").trim();
-  console.log(`[ivr-verify] callId=${callId} dob="${speech.slice(0, 50)}"`);
+  const callId  = String(req.query.call_id || "").trim();
+  const attempt = parseInt(req.query.attempt || "1", 10);
+  const speech  = String(req.body.SpeechResult || "").trim();
 
-  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
-  const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
+  console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+  // DOB check — fixed to January 1, 2000 for POC
+  const hasDob = /jan(uary)?/i.test(speech) &&
+                 /(first|\b1\b|1st)/i.test(speech) &&
+                 /(2000|two thousand)/i.test(speech);
+
+  // Name check — customer first name must appear in speech
+  let hasName = false;
+  let matchedCustomer = null;
+  try {
+    const { data: customers } = await supabase
+      .from("customers")
+      .select("id, name, tier, phone")
+      .limit(200);
+    if (customers && customers.length > 0) {
+      const lowerSpeech = speech.toLowerCase();
+      for (const c of customers) {
+        const firstName = (c.name || "").toLowerCase().split(" ")[0];
+        if (firstName && lowerSpeech.includes(firstName)) {
+          hasName = true;
+          matchedCustomer = c;
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[ivr-verify] Customer lookup error:", err.message);
+  }
+
+  const verified = hasDob && hasName;
+  console.log(`[ivr-verify] hasDob=${hasDob} hasName=${hasName} verified=${verified} customer=${matchedCustomer?.name || "none"}`);
+
+  if (verified) {
+    // Update call record with matched customer details
+    if (matchedCustomer && callId) {
+      supabase.from("calls").update({
+        customer_name:  matchedCustomer.name,
+        customer_phone: matchedCustomer.phone || null,
+        tier:           matchedCustomer.tier  || null,
+      }).eq("id", callId).then(({ error }) => {
+        if (error) console.error("[ivr-verify] Call update error:", error.message);
+        else console.log(`[ivr-verify] Call linked to customer: ${matchedCustomer.name}`);
+      });
+    }
+    const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
-    <Say voice="alice">Thank you, your name and date of birth have been verified. For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. Or in a few words, please tell me how I can help you.</Say>
+  <Gather input="dtmf" action="${menuUrl}" method="POST" timeout="8" numDigits="1">
+    <Say voice="alice">Thank you, your identity has been verified. For Billing press 1. For Service related queries press 2. For New Connection press 3. For General queries press 4.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
+  }
+
+  // Verification failed
+  if (attempt >= 2) {
+    if (callId) supabase.from("calls").update({ status: "disconnected" }).eq("id", callId).then(() => {});
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Sorry, we could not verify your identity. Thank you for calling BrightSuite. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+  }
+
+  // Attempt 1 failed — reprompt once
+  const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}&attempt=2`);
+  const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=2`);
+  return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
+    <Say voice="alice">Sorry, we could not verify your details. Please say your full name and date of birth again. For example, John Smith, January first, two thousand.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
 });
 
 // -- IVR: menu selection handler ------------------------------
-// Called by Twilio after customer presses a digit or speaks.
+// Called by Twilio after customer presses a digit.
+// 1=Billing  2=Service  3=New Connection  4=General
 app.post("/api/twilio/ivr-menu", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
-  const callId      = String(req.query.call_id   || "").trim();
-  const digits      = String(req.body.Digits      || "").trim();
-  const speech      = String(req.body.SpeechResult || "").trim();
+  const callId      = String(req.query.call_id  || "").trim();
+  const menuAttempt = parseInt(req.query.attempt || "1", 10);
+  const digits      = String(req.body.Digits     || "").trim();
 
-  console.log(`[ivr-menu] callId=${callId} digits="${digits}" speech="${speech.slice(0, 60)}"`);
+  console.log(`[ivr-menu] callId=${callId} menuAttempt=${menuAttempt} digits="${digits}"`);
 
-  // Map input to a support category
-  let category, categoryLabel;
-  if (digits === "1" || /billing|bill|payment|invoice|charge/i.test(speech)) {
-    category = "billing";      categoryLabel = "Billing";
-  } else if (digits === "2" || /new line|new service|add line|upgrade|plan|activate/i.test(speech)) {
-    category = "new_lines";    categoryLabel = "New Lines and Services";
-  } else if (digits === "3" || /service|technical|issue|problem|not working|outage|slow|broken/i.test(speech)) {
-    category = "service";      categoryLabel = "Service Support";
-  } else if (digits === "4" || /general|other|help|anything/i.test(speech)) {
-    category = "general";      categoryLabel = "General Inquiries";
+  // Map digit to support category
+  let category, categoryLabel, validSelection = true;
+  if (digits === "1") {
+    category = "billing";        categoryLabel = "Billing";
+  } else if (digits === "2") {
+    category = "service";        categoryLabel = "Service Support";
+  } else if (digits === "3") {
+    category = "new_connection"; categoryLabel = "New Connection";
+  } else if (digits === "4") {
+    category = "general";        categoryLabel = "General Inquiries";
   } else {
-    category = "general";      categoryLabel = "General Inquiries";
+    validSelection = false;
+  }
+
+  // No valid selection — redirect to no-input handler with current attempt count
+  if (!validSelection) {
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=${menuAttempt}`);
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
   }
 
   if (callId) {
@@ -597,8 +673,8 @@ app.post("/api/twilio/ivr-menu", async (req, res) => {
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${queryUrl}" method="POST" timeout="8" speechTimeout="auto">
-    <Say voice="alice">I will connect you with our ${escapeXml(categoryLabel)} team. Please briefly describe your issue in a few words.</Say>
+  <Gather input="speech" action="${queryUrl}" method="POST" timeout="10" speechTimeout="auto">
+    <Say voice="alice">I will connect you with our ${escapeXml(categoryLabel)} team. Please tell your query in a few words.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -646,10 +722,10 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
       to:   `client:${agentIdentity}`,
       from: TWILIO_PHONE_NUMBER,
       url:  agentUrl,
-      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}`,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}&category=${category}&attempt=1`,
       statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
       statusCallbackMethod: "POST",
-      timeout: 8,
+      timeout: 12,
     }).then((call) => {
       console.log(`[ivr-query] Agent call created ✓ SID=${call.sid} identity=${agentIdentity}`);
     }).catch((err) => {
@@ -664,9 +740,9 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
   console.log(`[ivr-query] Customer conference TwiML sent ✓`);
 });
 
-// -- IVR: no-input handler ------------------------------------
-// First attempt: reprompt with "I have not received any input."
-// Second attempt: disconnect gracefully.
+// -- IVR: no-input / invalid-selection handler ----------------
+// Handles timeouts and invalid selections at each IVR step.
+// Allows one reprompt per step before disconnecting.
 app.post("/api/twilio/ivr-noinput", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
@@ -677,40 +753,69 @@ app.post("/api/twilio/ivr-noinput", async (req, res) => {
 
   console.log(`[ivr-noinput] callId=${callId} step=${step} attempt=${attempt}`);
 
-  if (attempt >= 2) {
-    // Second silence → disconnect gracefully
-    if (callId) {
-      supabase.from("calls").update({ status: "disconnected" })
-        .eq("id", callId)
-        .then(({ error }) => { if (error) console.error("[ivr-noinput] Status update:", error.message); });
-    }
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+  const markDisconnected = () => {
+    if (callId) supabase.from("calls").update({ status: "disconnected" }).eq("id", callId).then(() => {});
+  };
+
+  // ── Verification step ───────────────────────────────────────
+  if (step === "verify") {
+    if (attempt >= 2) {
+      markDisconnected();
+      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">We did not receive a response. Thank you for calling BrightSuite. Goodbye.</Say>
   <Hangup/>
 </Response>`);
-  }
-
-  // First silence — reprompt based on which step timed out
-  if (step === "query") {
-    const queryUrl   = escapeXml(`${BASE_URL}/api/twilio/ivr-query?call_id=${callId}&category=${category}`);
-    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=query&category=${category}&attempt=2`);
+    }
+    const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}&attempt=2`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=2`);
     return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${queryUrl}" method="POST" timeout="8" speechTimeout="auto">
-    <Say voice="alice">I have not received any input. Please tell your query in a few words.</Say>
+  <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
+    <Say voice="alice">Sorry, I did not receive any input. Please say your full name and date of birth. For example, John Smith, January first, two thousand.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
   }
 
-  // step === "menu"
-  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
+  // ── Query capture step ──────────────────────────────────────
+  if (step === "query") {
+    if (attempt >= 2) {
+      markDisconnected();
+      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We did not receive a response. Thank you for calling BrightSuite. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+    }
+    const queryUrl   = escapeXml(`${BASE_URL}/api/twilio/ivr-query?call_id=${callId}&category=${category}`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=query&category=${category}&attempt=2`);
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="${queryUrl}" method="POST" timeout="10" speechTimeout="auto">
+    <Say voice="alice">Sorry, I did not receive any input. Please tell your query in a few words.</Say>
+  </Gather>
+  <Redirect method="POST">${noInputUrl}</Redirect>
+</Response>`);
+  }
+
+  // ── Menu step (no input or invalid digit) ───────────────────
+  if (attempt >= 2) {
+    markDisconnected();
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Sorry, no option selected. Please try again. Thank you for calling BrightSuite. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+  }
+
+  // First reprompt — "you have not selected any option"
+  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}&attempt=2`);
   const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=2`);
   return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
-    <Say voice="alice">I have not received any input. For Billing press 1, for New Lines or New Services press 2, for Service related Queries press 3. Or please tell me how I can help you.</Say>
+  <Gather input="dtmf" action="${menuUrl}" method="POST" timeout="8" numDigits="1">
+    <Say voice="alice">You have not selected any option, please choose one option. For Billing press 1, for Service press 2, for New Connection press 3, for General queries press 4.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -830,41 +935,92 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 // -- Agent dial status callback (fired when agent call ends/fails) -
 // Handles no-answer/busy/failed by first trying the general pool,
 // then redirecting the waiting customer if still no one picks up.
+// -- Agent dial status callback --------------------------------
+// attempt=1 or 2 → play "agents busy, please wait" and re-dial
+// attempt=3      → all retries exhausted, disconnect customer
 app.post("/api/twilio/agent-status", async (req, res) => {
   res.status(200).end();
 
   const callId   = String(req.query.call_id  || "").trim();
   const identity = String(req.query.identity || "").trim();
+  const category = String(req.query.category || "general").trim();
+  const attempt  = parseInt(req.query.attempt || "1", 10);
   const status   = String(req.body.CallStatus || "").trim();
 
-  console.log(`[agent-status] callId=${callId} identity=${identity} status=${status}`);
+  console.log(`[agent-status] callId=${callId} identity=${identity} category=${category} attempt=${attempt} status=${status}`);
 
   if (!callId || !twilioClient) return;
   if (!["no-answer", "busy", "failed"].includes(status)) return;
 
-  if (identity !== "agent_general") {
-    // First failure — try the general pool as a fallback
-    console.log(`[agent-status] No answer from ${identity} — trying agent_general`);
-    const fallbackUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-    twilioClient.calls.create({
-      to:   "client:agent_general",
-      from: TWILIO_PHONE_NUMBER,
-      url:  fallbackUrl,
-      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=agent_general`,
-      statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
-      statusCallbackMethod: "POST",
-      timeout: 8,
-    }).then((call) => {
-      console.log(`[agent-status] Fallback agent call created ✓ SID=${call.sid}`);
-    }).catch((err) => {
-      console.error(`[agent-status] Fallback dial FAILED: ${err.message}`);
-      redirectCustomerToNoAgentMessage(callId);
-    });
-  } else {
-    // General pool also failed — no agents available at all
-    console.log(`[agent-status] No agents available — redirecting customer callId=${callId}`);
+  if (attempt >= 3) {
+    console.log(`[agent-status] All attempts exhausted — disconnecting callId=${callId}`);
     redirectCustomerToNoAgentMessage(callId);
+    return;
   }
+
+  // Redirect customer to wait message; agent-waiting re-dials
+  console.log(`[agent-status] attempt=${attempt} — redirecting to wait message callId=${callId}`);
+  redirectCustomerTo(
+    callId,
+    `${BASE_URL}/api/twilio/agent-waiting?call_id=${callId}&category=${category}&attempt=${attempt}`
+  );
+});
+
+// -- Customer wait TwiML + agent re-dial ----------------------
+// Plays "agents are busy" message, puts customer back in conference,
+// then re-dials the agent pool after a short delay.
+app.post("/api/twilio/agent-waiting", (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const category = String(req.query.category || "general").trim();
+  const attempt  = parseInt(req.query.attempt || "1", 10);
+
+  console.log(`[agent-waiting] callId=${callId} category=${category} attempt=${attempt}`);
+
+  if (twilioClient && TWILIO_PHONE_NUMBER && callId) {
+    const agentIdentity = categoryToAgentIdentity(category);
+    const agentUrl      = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    setTimeout(() => {
+      twilioClient.calls.create({
+        to:   `client:${agentIdentity}`,
+        from: TWILIO_PHONE_NUMBER,
+        url:  agentUrl,
+        statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}&category=${category}&attempt=${attempt + 1}`,
+        statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+        statusCallbackMethod: "POST",
+        timeout: 12,
+      }).then((call) => {
+        console.log(`[agent-waiting] Re-dialled agent ✓ SID=${call.sid} attempt=${attempt + 1}`);
+      }).catch((err) => {
+        console.error(`[agent-waiting] Re-dial FAILED: ${err.message}`);
+        redirectCustomerToNoAgentMessage(callId);
+      });
+    }, 3_000);
+  }
+
+  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  const room             = `room-${callId}`;
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Agents are busy on other calls. Please wait while we connect you.</Say>
+  <Start>
+    <Transcription statusCallbackUrl="${transcriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
+  <Dial>
+    <Conference beep="false"
+                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                statusCallbackEvent="end"
+                statusCallback="${statusUrl}"
+                statusCallbackMethod="POST">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`);
 });
 
 // -- Twilio recording-status webhook (fires when Twilio recording completes) --
@@ -902,7 +1058,7 @@ app.post("/api/twilio/no-agent-available", (_req, res) => {
   res.set("Content-Type", "text/xml");
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">We are sorry, but all agents are currently unavailable. Please call back during business hours or visit our website for assistance. Thank you for calling BrightSuite.</Say>
+  <Say voice="alice">Agents are busy right now. Please try again after some time. Thank you for calling BrightSuite.</Say>
   <Hangup/>
 </Response>`);
 });
