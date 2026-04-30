@@ -166,9 +166,9 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
-  const room               = `room-${callId}`;
+  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=agent`);
+  const room             = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -180,10 +180,9 @@ function agentConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false" waitUrl=""
                 endConferenceOnExit="true"
-                record="record-from-start"
-                recordingStatusCallback="${recordingStatusUrl}"
-                recordingStatusCallbackMethod="POST"
-                recordingStatusCallbackEvent="completed absent">
+                statusCallback="${statusUrl}"
+                statusCallbackMethod="POST"
+                statusCallbackEvent="participant-join end">
       ${room}
     </Conference>
   </Dial>
