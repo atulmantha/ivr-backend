@@ -1376,7 +1376,7 @@ Rules:
           headers: { "Content-Type": "application/json" },
           body:    JSON.stringify({
             contents:         [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 1000, temperature: 0.2 },
+            generationConfig: { maxOutputTokens: 1000, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
           }),
           signal: controller.signal,
         });
