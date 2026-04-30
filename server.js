@@ -560,24 +560,23 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  // Name check — query DB with each meaningful word from speech using ILIKE.
-  // Skips common filler/date words to avoid false matches.
-  const SKIP_WORDS = /^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?|first|second|third|fourth|one|two|three|four|five|six|seven|eight|nine|zero|thousand|hundred|and|the|my|name|is|date|birth|of|hi|hello|yes|this)$/i;
+  // Name check — fetch all customers and check if any part of their name appears in speech.
+  // This is more reliable than word-splitting the speech and querying per word.
   let hasName = false;
   let matchedCustomer = null;
   try {
-    const words = speech.split(/[\s,.\-]+/).map(w => w.trim()).filter(w => w.length >= 3 && !SKIP_WORDS.test(w));
-    console.log(`[ivr-verify] Name search words: ${words.join(", ") || "(none)"}`);
-    for (const word of words) {
-      const { data: match } = await supabase
-        .from("customers")
-        .select("id, name, tier, phone")
-        .ilike("name", `%${word}%`)
-        .limit(1)
-        .maybeSingle();
-      if (match) {
+    const speechLower = speech.toLowerCase();
+    const { data: allCustomers, error: custErr } = await supabase
+      .from("customers")
+      .select("id, name, tier, phone")
+      .limit(500);
+    if (custErr) throw new Error(custErr.message);
+    console.log(`[ivr-verify] Checking speech against ${(allCustomers || []).length} customers`);
+    for (const c of (allCustomers || [])) {
+      const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
+      if (nameParts.some(part => speechLower.includes(part))) {
         hasName = true;
-        matchedCustomer = match;
+        matchedCustomer = c;
         break;
       }
     }
