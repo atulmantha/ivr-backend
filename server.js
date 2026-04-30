@@ -166,9 +166,10 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=agent`);
-  const room             = `room-${callId}`;
+  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const statusUrl          = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=agent`);
+  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
+  const room               = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -182,7 +183,11 @@ function agentConferenceTwiml(callId) {
                 endConferenceOnExit="true"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST"
-                statusCallbackEvent="participant-join end">
+                statusCallbackEvent="end"
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackMethod="POST"
+                recordingStatusCallbackEvent="completed absent">
       ${room}
     </Conference>
   </Dial>
@@ -885,7 +890,7 @@ app.post("/api/twilio/recording-status", async (req, res) => {
     recording_url:    recordingUrl || null,
     duration_seconds: isNaN(duration) ? null : duration,
     status,
-    ended_at:         status === "completed" ? new Date().toISOString() : null,
+    completed_at:     status === "completed" ? new Date().toISOString() : null,
   }, { onConflict: "recording_sid" });
 
   if (error) console.error("[recording-status/twilio] Save error:", error.message);
@@ -916,53 +921,6 @@ app.post("/api/conference-status", (req, res) => {
 
   console.log(`[conference-status] event=${event} role=${role} callId=${callId} confSid=${conferenceSid}`);
 
-  // Trigger recording on the join that signals both parties are connected:
-  //   inbound:  agent joins  (customer was already in the conference waiting)
-  //   outbound: customer joins (agent was already in the conference waiting)
-  const shouldRecord =
-    event === "participant-join" &&
-    (role === "agent" || role === "customer") &&
-    conferenceSid && callId && twilioClient;
-
-  if (shouldRecord) {
-    (async () => {
-      try {
-        const { data: existing } = await supabase
-          .from("recordings")
-          .select("id")
-          .eq("call_id", callId)
-          .in("status", ["pending", "in-progress", "completed"])
-          .limit(1);
-
-        if (existing && existing.length > 0) {
-          console.log(`[conference-status] Recording already exists for ${callId} — skipping`);
-          return;
-        }
-
-        const { data: callRow } = await supabase
-          .from("calls").select("call_type").eq("id", callId).maybeSingle();
-
-        const recordingCb = `${BASE_URL}/api/recording-status?call_id=${callId}`;
-        const rec = await twilioClient.conferences(conferenceSid).recordings.create({
-          recordingStatusCallback:       recordingCb,
-          recordingStatusCallbackMethod: "POST",
-        });
-
-        await supabase.from("recordings").insert({
-          call_id:        callId,
-          recording_sid:  rec.sid,
-          conference_sid: conferenceSid,
-          call_type:      callRow?.call_type || "inbound",
-          status:         "in-progress",
-          started_at:     new Date().toISOString(),
-        });
-        console.log(`[conference-status] Recording started ✓ sid=${rec.sid}`);
-      } catch (err) {
-        console.error("[conference-status] Failed to start recording:", err.message);
-      }
-    })();
-  }
-
   if (event === "conference-end" && callId) {
     console.log(`[conference-status] Conference ended callId=${callId}`);
     supabase.from("calls").update({ status: "disconnected" })
@@ -990,7 +948,7 @@ app.post("/api/conference-status", (req, res) => {
               recording_url:    rec.mediaUrl || null,
               duration_seconds: rec.duration ? parseInt(String(rec.duration), 10) : null,
               status:           rec.status,
-              ended_at:         rec.status === "completed" ? new Date().toISOString() : null,
+              completed_at:     rec.status === "completed" ? new Date().toISOString() : null,
             }, { onConflict: "recording_sid" });
             if (error) console.error(`[recording-sync] Upsert error sid=${rec.sid}:`, error.message);
             else console.log(`[recording-sync] Recording saved ✓ sid=${rec.sid} status=${rec.status}`);
@@ -1024,7 +982,7 @@ app.post("/api/recording-status", async (req, res) => {
       status:           "completed",
       recording_url:    url,
       duration_seconds: isNaN(duration) ? null : duration,
-      ended_at:         new Date().toISOString(),
+      completed_at:     new Date().toISOString(),
     }).eq("recording_sid", recordingSid);
     if (error) console.error("[recording-status] DB update error:", error.message);
     else console.log(`[recording-status] Recording completed ✓ ${recordingSid}`);
