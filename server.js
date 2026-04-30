@@ -560,22 +560,17 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  // Name check — fetch all customers and check if any part of their name appears in speech.
-  // This is more reliable than word-splitting the speech and querying per word.
-  let hasName = false;
+  // Best-effort customer lookup — populates the call record but does NOT gate verification.
   let matchedCustomer = null;
   try {
     const speechLower = speech.toLowerCase();
-    const { data: allCustomers, error: custErr } = await supabase
+    const { data: allCustomers } = await supabase
       .from("customers")
       .select("id, name, tier, phone")
       .limit(500);
-    if (custErr) throw new Error(custErr.message);
-    console.log(`[ivr-verify] Checking speech against ${(allCustomers || []).length} customers`);
     for (const c of (allCustomers || [])) {
       const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
       if (nameParts.some(part => speechLower.includes(part))) {
-        hasName = true;
         matchedCustomer = c;
         break;
       }
@@ -584,8 +579,8 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
     console.error("[ivr-verify] Customer lookup error:", err.message);
   }
 
-  const verified = hasName;
-  console.log(`[ivr-verify] hasName=${hasName} verified=${verified} customer=${matchedCustomer?.name || "none"}`);
+  const verified = true;
+  console.log(`[ivr-verify] verified=true (always pass) customer=${matchedCustomer?.name || "none"}`);
 
   if (verified) {
     // Update call record with matched customer details
