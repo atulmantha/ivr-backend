@@ -336,8 +336,18 @@ async function runAnalysisPipeline(callId, transcript) {
       const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
 
       const customerData   = { name: customerName, tier, billingContext };
+
+      // Fetch recent conversation turns so the AI knows what was already answered
+      const { data: recentMessages } = await supabase
+        .from("messages")
+        .select("role, content")
+        .eq("call_id", callId)
+        .order("created_at", { ascending: false })
+        .limit(6);
+      const conversationHistory = (recentMessages || []).reverse();
+
       // Use the full combined transcript so the reply addresses the complete thought
-      const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion);
+      const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion, conversationHistory);
       console.log(`[analysis] suggested reply generated: "${(suggestedReply || "").slice(0, 80)}"`);
 
       if (suggestedReply) {
@@ -528,7 +538,7 @@ app.post("/api/twilio/voice", async (req, res) => {
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Welcome to BrightSuite! To verify your identity, please say your full name and date of birth. For example, say John Smith, January first, two thousand.</Say>
+    <Say voice="alice">Welcome to BrightSuite! To verify your identity, please say your full name and date of birth.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -540,8 +550,7 @@ app.post("/api/twilio/voice", async (req, res) => {
   }
 });
 
-// -- IVR: identity verification (name + DOB) ------------------
-// POC: DOB is fixed to January 1, 2000 for all users.
+// -- IVR: identity verification (name only) -------------------
 // Validates name against the customers table; allows 2 attempts total.
 app.post("/api/twilio/ivr-verify", async (req, res) => {
   res.set("Content-Type", "text/xml");
@@ -551,19 +560,13 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  // DOB check — fixed to January 1, 2000 for POC
-  // Handles: "Jan 1st 2000", "January first two thousand", "Jan 1 2000", "Jan 1st 2,000"
-  const hasDob = /jan(uary)?/i.test(speech) &&
-                 /(first|one|\b1\b|1st)/i.test(speech) &&
-                 /(2[,.]?000|two[\s-]?thousand)/i.test(speech);
-
   // Name check — query DB with each meaningful word from speech using ILIKE.
-  // Skips common date/time words to avoid false matches.
-  const DATE_WORDS = /^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?|first|second|third|fourth|one|two|three|four|five|six|seven|eight|nine|zero|thousand|hundred|and|the|my|name|is|date|birth|of)$/i;
+  // Skips common filler/date words to avoid false matches.
+  const SKIP_WORDS = /^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?|first|second|third|fourth|one|two|three|four|five|six|seven|eight|nine|zero|thousand|hundred|and|the|my|name|is|date|birth|of|hi|hello|yes|this)$/i;
   let hasName = false;
   let matchedCustomer = null;
   try {
-    const words = speech.split(/[\s,.\-]+/).map(w => w.trim()).filter(w => w.length >= 3 && !DATE_WORDS.test(w));
+    const words = speech.split(/[\s,.\-]+/).map(w => w.trim()).filter(w => w.length >= 3 && !SKIP_WORDS.test(w));
     console.log(`[ivr-verify] Name search words: ${words.join(", ") || "(none)"}`);
     for (const word of words) {
       const { data: match } = await supabase
@@ -582,8 +585,8 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
     console.error("[ivr-verify] Customer lookup error:", err.message);
   }
 
-  const verified = hasDob && hasName;
-  console.log(`[ivr-verify] hasDob=${hasDob} hasName=${hasName} verified=${verified} customer=${matchedCustomer?.name || "none"}`);
+  const verified = hasName;
+  console.log(`[ivr-verify] hasName=${hasName} verified=${verified} customer=${matchedCustomer?.name || "none"}`);
 
   if (verified) {
     // Update call record with matched customer details
@@ -624,7 +627,7 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
   return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Sorry, we could not verify your details. Please say your full name and date of birth again. For example, John Smith, January first, two thousand.</Say>
+    <Say voice="alice">Sorry, we could not verify your details. Please say your full name and date of birth again.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -775,7 +778,7 @@ app.post("/api/twilio/ivr-noinput", async (req, res) => {
     return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Sorry, I did not receive any input. Please say your full name and date of birth. For example, John Smith, January first, two thousand.</Say>
+    <Say voice="alice">Sorry, I did not receive any input. Please say your full name and date of birth.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
