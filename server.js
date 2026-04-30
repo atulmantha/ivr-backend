@@ -552,27 +552,30 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
   // DOB check — fixed to January 1, 2000 for POC
+  // Handles: "Jan 1st 2000", "January first two thousand", "Jan 1 2000", "Jan 1st 2,000"
   const hasDob = /jan(uary)?/i.test(speech) &&
-                 /(first|\b1\b|1st)/i.test(speech) &&
-                 /(2000|two thousand)/i.test(speech);
+                 /(first|one|\b1\b|1st)/i.test(speech) &&
+                 /(2[,.]?000|two[\s-]?thousand)/i.test(speech);
 
-  // Name check — customer first name must appear in speech
+  // Name check — query DB with each meaningful word from speech using ILIKE.
+  // Skips common date/time words to avoid false matches.
+  const DATE_WORDS = /^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?|first|second|third|fourth|one|two|three|four|five|six|seven|eight|nine|zero|thousand|hundred|and|the|my|name|is|date|birth|of)$/i;
   let hasName = false;
   let matchedCustomer = null;
   try {
-    const { data: customers } = await supabase
-      .from("customers")
-      .select("id, name, tier, phone")
-      .limit(200);
-    if (customers && customers.length > 0) {
-      const lowerSpeech = speech.toLowerCase();
-      for (const c of customers) {
-        const firstName = (c.name || "").toLowerCase().split(" ")[0];
-        if (firstName && lowerSpeech.includes(firstName)) {
-          hasName = true;
-          matchedCustomer = c;
-          break;
-        }
+    const words = speech.split(/[\s,.\-]+/).map(w => w.trim()).filter(w => w.length >= 3 && !DATE_WORDS.test(w));
+    console.log(`[ivr-verify] Name search words: ${words.join(", ") || "(none)"}`);
+    for (const word of words) {
+      const { data: match } = await supabase
+        .from("customers")
+        .select("id, name, tier, phone")
+        .ilike("name", `%${word}%`)
+        .limit(1)
+        .maybeSingle();
+      if (match) {
+        hasName = true;
+        matchedCustomer = match;
+        break;
       }
     }
   } catch (err) {
