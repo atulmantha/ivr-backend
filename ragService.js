@@ -75,7 +75,7 @@ async function generateGreeting(customerName, tier = "Regular") {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 80, temperature: 0.4 },
+        generationConfig: { maxOutputTokens: 80, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
       }),
     });
     if (!res.ok) throw new Error(`Gemini API ${res.status}`);
@@ -147,7 +147,7 @@ async function generateSuggestedReply(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 200, temperature: 0.2 },
+        generationConfig: { maxOutputTokens: 200, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
       }),
       signal: controller.signal,
     });
