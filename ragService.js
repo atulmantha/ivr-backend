@@ -106,20 +106,28 @@ async function generateSuggestedReply(
     : null;
 
   const isAngry = emotion === "angry" || emotion === "frustrated";
-  const toneInstruction = isAngry
-    ? [
-        `IMPORTANT — The customer is ${emotion}. Start your reply with a genuine empathy phrase, for example:`,
-        `"I completely understand your frustration, and I sincerely apologize for the inconvenience."`,
-        `"I'm really sorry you're experiencing this — let me take care of it for you right now."`,
-        `After the empathy opener, immediately give the resolution or next concrete step.`,
-      ].join("\n")
-    : "Use a warm, calm, and helpful tone throughout.";
+  const isConfused = emotion === "confused";
+  let toneInstruction;
+  if (isAngry) {
+    toneInstruction = [
+      `IMPORTANT — The customer is ${emotion}. Open with a sincere empathy statement such as:`,
+      `"I completely understand your frustration, and I sincerely apologize for any inconvenience caused."`,
+      `"I'm truly sorry you're going through this — let me resolve it for you right away."`,
+      `Then immediately give the concrete answer or resolution. Do not over-apologize — one empathy line, then the answer.`,
+    ].join("\n");
+  } else if (isConfused) {
+    toneInstruction = "The customer seems confused. Be reassuring and patient. Walk through the answer step by step in plain language.";
+  } else {
+    toneInstruction = "Use a warm, professional, and helpful tone throughout.";
+  }
 
   const historySection = conversationHistory.length > 0
     ? `Recent conversation (oldest first):\n${conversationHistory
         .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
         .join("\n")}`
     : null;
+
+  const customerFirstName = (customerData?.name || "").split(" ")[0] || null;
 
   const prompt = [
     `You are coaching a call center agent handling a ${tier} tier customer.`,
@@ -137,13 +145,15 @@ async function generateSuggestedReply(
     "",
     "Write the exact words the agent should say to the customer.",
     "Rules:",
-    "- Answer ONLY the customer's LATEST question above. Do NOT repeat information already given earlier in the conversation.",
-    "- Do NOT start with 'Hello', 'Hi', or any greeting — the customer has already been greeted. Go straight to addressing their concern.",
-    "- 1-3 short sentences. Voice-friendly — natural spoken language, no jargon.",
-    "- If the retrieved data contains specific bill amounts, payment dates, due dates, or account figures, state them explicitly and precisely.",
-    "- NEVER say 'I will look that up', 'let me check', or 'one moment' if the data is already present above — quote it directly.",
-    "- If data is genuinely not available, acknowledge that clearly and offer the next step.",
-    "- Address the customer by name if known.",
+    "- Answer ONLY the customer's LATEST question. Do NOT repeat or re-state information that was already given earlier in the conversation above.",
+    "- Do NOT start with 'Hello', 'Hi', or any greeting — go straight to addressing the concern.",
+    "- Give a clear, helpful answer in 2-4 sentences. Include all relevant figures, dates, or details from the data above — do not be vague.",
+    "- If the data contains specific values (amounts, dates, usage figures, charges), quote them explicitly.",
+    "- If the customer asked about something (e.g. energy consumption, specific charges) and that information is NOT in the data above, say so clearly and offer to escalate or investigate further — do NOT substitute an answer about something else.",
+    "- NEVER say 'I will look that up', 'let me check', or 'one moment' if the data is already present above — use it directly.",
+    customerFirstName
+      ? `- Use the customer's first name (${customerFirstName}) at most ONCE in the reply, only if it sounds natural. Do not use it in every sentence.`
+      : "- Do not address the customer by name.",
     "Return only the agent's reply text — no labels, no quotes, no preamble.",
   ].filter((line) => line !== "").join("\n");
 
@@ -157,7 +167,7 @@ async function generateSuggestedReply(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 200, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
+        generationConfig: { maxOutputTokens: 300, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
       }),
       signal: controller.signal,
     });
