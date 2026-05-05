@@ -2,7 +2,7 @@ const { normalizeEmotion } = require("./emotionService");
 const { normalizeIntent, isHighStakesIntent } = require("./intentService");
 
 const GEMINI_GENERATE_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
 async function geminiGenerate(prompt, maxOutputTokens = 300, temperature = 0.2) {
   const key = process.env.GEMINI_API_KEY;
@@ -11,7 +11,7 @@ async function geminiGenerate(prompt, maxOutputTokens = 300, temperature = 0.2) 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens, temperature },
+      generationConfig: { maxOutputTokens, temperature, thinkingConfig: { thinkingBudget: 0 } },
     }),
   });
   if (!res.ok) throw new Error(`Gemini API ${res.status}`);
@@ -19,12 +19,21 @@ async function geminiGenerate(prompt, maxOutputTokens = 300, temperature = 0.2) 
   return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
 }
 
-function buildAnalysisPrompt(userInput, tier) {
-  return [
+function buildAnalysisPrompt(userInput, tier, billingContext) {
+  const lines = [
     "You are an AI assistant for call center agents. Analyze the customer speech below.",
     `Customer tier: ${tier || "Regular"}`,
     `Customer said: "${userInput}"`,
     "",
+  ];
+
+  if (billingContext) {
+    lines.push("Customer billing data already retrieved:");
+    lines.push(billingContext);
+    lines.push("");
+  }
+
+  lines.push(
     "Return ONLY valid JSON — no markdown, no code blocks, no explanation:",
     JSON.stringify({
       emotion: "<calm|confused|frustrated|angry>",
@@ -35,8 +44,12 @@ function buildAnalysisPrompt(userInput, tier) {
     "Rules:",
     "- emotion: exactly one of calm, confused, frustrated, angry",
     "- intent: snake_case label that best describes the customer's issue",
-    "- suggested_actions: 2-3 specific, actionable steps the human agent should take right now",
-  ].join("\n");
+    billingContext
+      ? "- suggested_actions: 2-3 RESOLUTION steps the agent should take. The billing data above is ALREADY available — do NOT suggest reviewing or checking the bill. Instead suggest concrete next steps like: offering a payment plan or extension, applying a one-time courtesy credit, explaining the specific charge that caused the increase, escalating to a billing supervisor, or processing an account adjustment."
+      : "- suggested_actions: 2-3 specific, actionable steps the human agent should take right now",
+  );
+
+  return lines.join("\n");
 }
 
 function computePriority(emotion, intent, tier) {
@@ -51,8 +64,8 @@ function computePriority(emotion, intent, tier) {
   return "low";
 }
 
-async function analyzeCustomerSpeech(userInput, customerTier = "Regular") {
-  const prompt = buildAnalysisPrompt(userInput, customerTier);
+async function analyzeCustomerSpeech(userInput, customerTier = "Regular", billingContext = null) {
+  const prompt = buildAnalysisPrompt(userInput, customerTier, billingContext);
   const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 5000;
 
   const controller = new AbortController();

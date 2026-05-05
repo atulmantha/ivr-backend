@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"const pkg = require\\('./package.json'\\); console.log\\(JSON.stringify\\(pkg.dependencies, null, 2\\)\\)\")",
+      "Bash(node -e \"const lock = require\\('./package-lock.json'\\); console.log\\('dotenv:', lock.packages['node_modules/dotenv']?.version\\); console.log\\('pdf-parse:', lock.packages['node_modules/pdf-parse']?.version\\); console.log\\('mammoth:', lock.packages['node_modules/mammoth']?.version\\); console.log\\('ws:', lock.packages['node_modules/ws']?.version\\); console.log\\('twilio:', lock.packages['node_modules/twilio']?.version\\);\")",
+      "Bash(node --check server.js)",
+      "Bash(node --check decisionEngine.js)",
+      "Bash(node --check ragService.js)",
+      "Bash(node --check transcriptionService.js)",
+      "Bash(node --check uploadService.js)",
+      "Bash(node -e ':*)",
+      "Bash(node -e \"require\\('dotenv'\\).config\\({ quiet: true }\\); console.log\\('done'\\)\")",
+      "Read(//c/Users/atul.mantha/Documents/**)",
+      "Bash(wc -l c:\\\\\\\\Users\\\\\\\\atul.mantha\\\\\\\\Documents\\\\\\\\ivr-backend\\\\\\\\server.js)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\atul.mantha\\Documents\\ivr-frontend\\app",
+      "C:\\Users\\atul.mantha\\Documents\\ivr-frontend\\app\\api\\recordings\\[sid]",
+      "c:\\Users\\atul.mantha\\Documents\\ivr-frontend"
+    ]
+  }
+}

@@ -10,7 +10,7 @@
 // =============================================================
 
 const GEMINI_GENERATE_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
 
 const express  = require("express");
 const http     = require("http");
@@ -38,7 +38,7 @@ app.use(cors({ origin: corsOrigin }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ── Auth module (independent — does not touch existing routes) ──
+// ── Auth module (new, independent — does not touch existing routes) ──
 app.use("/api/auth", authRoutes);
 
 // ── Env validation ────────────────────────────────────────────
@@ -140,7 +140,6 @@ async function lookupCustomerByPhone(rawPhone) {
 // Final transcripts are POSTed to /api/transcription by Twilio.
 function customerConferenceTwiml(callId) {
   const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
-  // Only listen for conference-end here (disconnect tracking); recording is triggered by agent join.
   const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
   const room             = `room-${callId}`;
   console.log(`[twiml] Transcription callback: ${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
@@ -156,9 +155,9 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="end"
+                statusCallbackEvent="join end"
                 statusCallback="${statusUrl}"
-                statusCallbackMethod="POST">
+                endConferenceOnExit="true">
       ${room}
     </Conference>
   </Dial>
@@ -167,7 +166,6 @@ function customerConferenceTwiml(callId) {
 
 function agentConferenceTwiml(callId) {
   const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const statusUrl          = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=agent`);
   const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
   const room               = `room-${callId}`;
 
@@ -181,9 +179,6 @@ function agentConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false" waitUrl=""
                 endConferenceOnExit="true"
-                statusCallback="${statusUrl}"
-                statusCallbackMethod="POST"
-                statusCallbackEvent="end"
                 record="record-from-start"
                 recordingStatusCallback="${recordingStatusUrl}"
                 recordingStatusCallbackMethod="POST"
@@ -243,7 +238,7 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
 
     if (!data || data.length === 0) return latestTranscript;
 
-    const WINDOW_MS = 10_000; // 10 seconds — covers typical STT lag
+    const WINDOW_MS = 45_000; // 45 seconds — covers typical STT lag
     const latestTime = new Date(data[0].created_at).getTime();
 
     const recentFragments = data
@@ -267,25 +262,6 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
 // /api/twilio/ivr-query (IVR-captured user query).
 async function runAnalysisPipeline(callId, transcript) {
   try {
-    // Deduplicate: skip if another pipeline ran for this call within the last 12 seconds.
-    // Multiple rapid STT fragments would otherwise each trigger separate Gemini calls,
-    // exhausting the free-tier rate limit (15 RPM) before any reply is generated.
-    const { data: recentRow } = await supabase
-      .from("analysis")
-      .select("created_at")
-      .eq("call_id", callId)
-      .neq("intent", "call_greeting")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (recentRow) {
-      const ageMs = Date.now() - new Date(recentRow.created_at).getTime();
-      if (ageMs < 12_000) {
-        console.log(`[analysis] Skipping pipeline — last run was ${ageMs}ms ago (< 12s)`);
-        return;
-      }
-    }
-
     const { data: callData } = await supabase
       .from("calls").select("*").eq("id", callId).maybeSingle();
     const tier          = callData?.tier          || "Regular";
@@ -336,18 +312,8 @@ async function runAnalysisPipeline(callId, transcript) {
       const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
 
       const customerData   = { name: customerName, tier, billingContext };
-
-      // Fetch recent conversation turns so the AI knows what was already answered
-      const { data: recentMessages } = await supabase
-        .from("messages")
-        .select("role, content")
-        .eq("call_id", callId)
-        .order("created_at", { ascending: false })
-        .limit(6);
-      const conversationHistory = (recentMessages || []).reverse();
-
       // Use the full combined transcript so the reply addresses the complete thought
-      const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion, conversationHistory);
+      const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion);
       console.log(`[analysis] suggested reply generated: "${(suggestedReply || "").slice(0, 80)}"`);
 
       if (suggestedReply) {
@@ -373,35 +339,35 @@ async function runAnalysisPipeline(callId, transcript) {
 
 // ── Routes ────────────────────────────────────────────────────
 
-app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
-
-// Maps the department stored in the agents table to a Twilio client identity,
-// so agents register under the correct pool for department-based routing.
-function departmentToAgentIdentity(department) {
+// ── Department-based routing helpers ─────────────────────────
+// Maps the IVR category chosen by the customer to the Twilio
+// client identity of the correct department agent pool.
+function categoryToAgentIdentity(category) {
   const map = {
+    billing:   "agent_billing",
+    new_lines: "agent_support",
+    service:   "agent_support",
+    general:   "agent_general",
+  };
+  return map[category] || "agent_general";
+}
+
+// Maps the department stored in the agents table to the same
+// Twilio client identity, so each agent registers under the right pool.
+function departmentToAgentIdentity(department) {
+  const deptMap = {
     "Billing":           "agent_billing",
     "Technical Support": "agent_support",
     "Sales":             "agent_support",
     "Customer Success":  "agent_support",
     "General":           "agent_general",
   };
-  return map[department] || "agent_general";
+  return deptMap[department] || "agent_general";
 }
 
-// Maps the IVR category chosen by the customer to the Twilio
-// client identity of the correct department agent pool.
-function categoryToAgentIdentity(category) {
-  const map = {
-    billing:        "agent_billing",
-    service:        "agent_support",
-    new_connection: "agent_support",
-    general:        "agent_general",
-  };
-  return map[category] || "agent_general";
-}
-
-// Redirects all participants in a live conference to an arbitrary TwiML URL.
-async function redirectCustomerTo(callId, url) {
+// Redirects every participant in a waiting conference to the
+// "no agents available" TwiML endpoint.
+async function redirectCustomerToNoAgentMessage(callId) {
   if (!twilioClient) return;
   try {
     const conferences = await twilioClient.conferences.list({
@@ -414,21 +380,22 @@ async function redirectCustomerTo(callId, url) {
       .conferences(conferences[0].sid)
       .participants.list({ limit: 20 });
     for (const p of participants) {
-      await twilioClient.calls(p.callSid).update({ url, method: "POST" });
+      await twilioClient.calls(p.callSid).update({
+        url:    `${BASE_URL}/api/twilio/no-agent-available`,
+        method: "POST",
+      });
     }
-    console.log(`[redirect] Customer redirected callId=${callId} → ${url}`);
+    console.log(`[no-agent] Customer redirected for callId=${callId}`);
   } catch (err) {
-    console.error("[redirect] Error:", err.message);
+    console.error("[no-agent] Redirect error:", err.message);
   }
 }
 
-function redirectCustomerToNoAgentMessage(callId) {
-  return redirectCustomerTo(callId, `${BASE_URL}/api/twilio/no-agent-available`);
-}
+app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
 
 // -- Twilio Access Token for agent browser softphone ----------
-// Accepts an optional Bearer token (Supabase JWT) to derive the agent's
-// department and assign the correct Twilio client identity.
+// Accepts an optional Bearer token (Supabase JWT) to derive the
+// agent's department and assign the correct Twilio client identity.
 // Falls back to "agent_general" if no auth header is present.
 app.get("/api/token", async (req, res) => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET) {
@@ -505,12 +472,12 @@ app.post("/api/twilio/voice", async (req, res) => {
     }).then(({ error }) => {
       if (error) { console.error("[voice] Call insert error:", error.message); return; }
       console.log(`[voice] Call inserted in DB ✓`);
-      // Best-effort column updates (silent if columns not yet migrated)
-      supabase.from("calls").update({ status: "ivr", call_type: "inbound" }).eq("id", callId).then(() => {});
+      // Best-effort status update (silent if column not yet migrated)
+      supabase.from("calls").update({ status: "ivr" }).eq("id", callId).then(() => {});
     });
 
-    const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}&attempt=1`);
-    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=1`);
+    const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
+    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
 
     // Generate AI greeting suggestion so it's ready when the agent connects
     if (customer?.name) {
@@ -537,8 +504,8 @@ app.post("/api/twilio/voice", async (req, res) => {
 
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Welcome to BrightSuite! To verify your identity, please say your full name and date of birth.</Say>
+  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
+    <Say voice="alice">For Billing, press 1. For New Lines or New Services, press 2. For Service related Queries, press 3. For General Inquiries, press 4. Or in a few words, please tell me how I can help you.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -550,116 +517,29 @@ app.post("/api/twilio/voice", async (req, res) => {
   }
 });
 
-// -- IVR: identity verification (name only) -------------------
-// Validates name against the customers table; allows 2 attempts total.
-app.post("/api/twilio/ivr-verify", async (req, res) => {
-  res.set("Content-Type", "text/xml");
-  const callId  = String(req.query.call_id || "").trim();
-  const attempt = parseInt(req.query.attempt || "1", 10);
-  const speech  = String(req.body.SpeechResult || "").trim();
-
-  console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
-
-  // Best-effort customer lookup — populates the call record but does NOT gate verification.
-  let matchedCustomer = null;
-  try {
-    const speechLower = speech.toLowerCase();
-    const { data: allCustomers } = await supabase
-      .from("customers")
-      .select("id, name, tier, phone")
-      .limit(500);
-    for (const c of (allCustomers || [])) {
-      const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
-      if (nameParts.some(part => speechLower.includes(part))) {
-        matchedCustomer = c;
-        break;
-      }
-    }
-  } catch (err) {
-    console.error("[ivr-verify] Customer lookup error:", err.message);
-  }
-
-  const verified = true;
-  console.log(`[ivr-verify] verified=true (always pass) customer=${matchedCustomer?.name || "none"}`);
-
-  if (verified) {
-    // Update call record with matched customer details
-    if (matchedCustomer && callId) {
-      supabase.from("calls").update({
-        customer_name:  matchedCustomer.name,
-        customer_phone: matchedCustomer.phone || null,
-        tier:           matchedCustomer.tier  || null,
-      }).eq("id", callId).then(({ error }) => {
-        if (error) console.error("[ivr-verify] Call update error:", error.message);
-        else console.log(`[ivr-verify] Call linked to customer: ${matchedCustomer.name}`);
-      });
-    }
-    const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
-    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=1`);
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="dtmf" action="${menuUrl}" method="POST" timeout="8" numDigits="1">
-    <Say voice="alice">Thank you, your identity has been verified. For Billing press 1. For Service related queries press 2. For New Connection press 3. For General queries press 4.</Say>
-  </Gather>
-  <Redirect method="POST">${noInputUrl}</Redirect>
-</Response>`);
-  }
-
-  // Verification failed
-  if (attempt >= 2) {
-    if (callId) supabase.from("calls").update({ status: "disconnected" }).eq("id", callId).then(() => {});
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Sorry, we could not verify your identity. Thank you for calling BrightSuite. Goodbye.</Say>
-  <Hangup/>
-</Response>`);
-  }
-
-  // Attempt 1 failed — reprompt once
-  const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}&attempt=2`);
-  const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=2`);
-  return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Sorry, we could not verify your details. Please say your full name and date of birth again.</Say>
-  </Gather>
-  <Redirect method="POST">${noInputUrl}</Redirect>
-</Response>`);
-});
-
 // -- IVR: menu selection handler ------------------------------
-// Called by Twilio after customer presses a digit.
-// 1=Billing  2=Service  3=New Connection  4=General
+// Called by Twilio after customer presses a digit or speaks.
 app.post("/api/twilio/ivr-menu", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
-  const callId      = String(req.query.call_id  || "").trim();
-  const menuAttempt = parseInt(req.query.attempt || "1", 10);
-  const digits      = String(req.body.Digits     || "").trim();
+  const callId      = String(req.query.call_id   || "").trim();
+  const digits      = String(req.body.Digits      || "").trim();
+  const speech      = String(req.body.SpeechResult || "").trim();
 
-  console.log(`[ivr-menu] callId=${callId} menuAttempt=${menuAttempt} digits="${digits}"`);
+  console.log(`[ivr-menu] callId=${callId} digits="${digits}" speech="${speech.slice(0, 60)}"`);
 
-  // Map digit to support category
-  let category, categoryLabel, validSelection = true;
-  if (digits === "1") {
-    category = "billing";        categoryLabel = "Billing";
-  } else if (digits === "2") {
-    category = "service";        categoryLabel = "Service Support";
-  } else if (digits === "3") {
-    category = "new_connection"; categoryLabel = "New Connection";
-  } else if (digits === "4") {
-    category = "general";        categoryLabel = "General Inquiries";
+  // Map input to a support category
+  let category, categoryLabel;
+  if (digits === "1" || /billing|bill|payment|invoice|charge/i.test(speech)) {
+    category = "billing";      categoryLabel = "Billing";
+  } else if (digits === "2" || /new line|new service|add line|upgrade|plan|activate/i.test(speech)) {
+    category = "new_lines";    categoryLabel = "New Lines and Services";
+  } else if (digits === "3" || /service|technical|issue|problem|not working|outage|slow|broken/i.test(speech)) {
+    category = "service";      categoryLabel = "Service Support";
+  } else if (digits === "4" || /general|other|help|anything/i.test(speech)) {
+    category = "general";      categoryLabel = "General Support";
   } else {
-    validSelection = false;
-  }
-
-  // No valid selection — redirect to no-input handler with current attempt count
-  if (!validSelection) {
-    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=${menuAttempt}`);
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Redirect method="POST">${noInputUrl}</Redirect>
-</Response>`);
+    category = "general";      categoryLabel = "General Support";
   }
 
   if (callId) {
@@ -673,8 +553,8 @@ app.post("/api/twilio/ivr-menu", async (req, res) => {
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${queryUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">I will connect you with our ${escapeXml(categoryLabel)} team. Please tell your query in a few words.</Say>
+  <Gather input="speech" action="${queryUrl}" method="POST" timeout="8" speechTimeout="auto">
+    <Say voice="alice">I will connect you with our ${escapeXml(categoryLabel)} team. Please briefly describe your issue in a few words.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
@@ -722,10 +602,10 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
       to:   `client:${agentIdentity}`,
       from: TWILIO_PHONE_NUMBER,
       url:  agentUrl,
-      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}&category=${category}&attempt=1`,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}`,
       statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
       statusCallbackMethod: "POST",
-      timeout: 12,
+      timeout: 8,
     }).then((call) => {
       console.log(`[ivr-query] Agent call created ✓ SID=${call.sid} identity=${agentIdentity}`);
     }).catch((err) => {
@@ -740,9 +620,9 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
   console.log(`[ivr-query] Customer conference TwiML sent ✓`);
 });
 
-// -- IVR: no-input / invalid-selection handler ----------------
-// Handles timeouts and invalid selections at each IVR step.
-// Allows one reprompt per step before disconnecting.
+// -- IVR: no-input handler ------------------------------------
+// First attempt: reprompt with "I have not received any input."
+// Second attempt: disconnect gracefully.
 app.post("/api/twilio/ivr-noinput", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
@@ -753,75 +633,48 @@ app.post("/api/twilio/ivr-noinput", async (req, res) => {
 
   console.log(`[ivr-noinput] callId=${callId} step=${step} attempt=${attempt}`);
 
-  const markDisconnected = () => {
-    if (callId) supabase.from("calls").update({ status: "disconnected" }).eq("id", callId).then(() => {});
-  };
-
-  // ── Verification step ───────────────────────────────────────
-  if (step === "verify") {
-    if (attempt >= 2) {
-      markDisconnected();
-      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+  if (attempt >= 2) {
+    // Second silence → disconnect gracefully
+    if (callId) {
+      supabase.from("calls").update({ status: "disconnected" })
+        .eq("id", callId)
+        .then(({ error }) => { if (error) console.error("[ivr-noinput] Status update:", error.message); });
+    }
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">We did not receive a response. Thank you for calling BrightSuite. Goodbye.</Say>
   <Hangup/>
-</Response>`);
-    }
-    const verifyUrl  = escapeXml(`${BASE_URL}/api/twilio/ivr-verify?call_id=${callId}&attempt=2`);
-    const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=verify&attempt=2`);
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="speech" action="${verifyUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Sorry, I did not receive any input. Please say your full name and date of birth.</Say>
-  </Gather>
-  <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
   }
 
-  // ── Query capture step ──────────────────────────────────────
+  // First silence — reprompt based on which step timed out
   if (step === "query") {
-    if (attempt >= 2) {
-      markDisconnected();
-      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">We did not receive a response. Thank you for calling BrightSuite. Goodbye.</Say>
-  <Hangup/>
-</Response>`);
-    }
     const queryUrl   = escapeXml(`${BASE_URL}/api/twilio/ivr-query?call_id=${callId}&category=${category}`);
     const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=query&category=${category}&attempt=2`);
     return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${queryUrl}" method="POST" timeout="10" speechTimeout="auto">
-    <Say voice="alice">Sorry, I did not receive any input. Please tell your query in a few words.</Say>
+  <Gather input="speech" action="${queryUrl}" method="POST" timeout="8" speechTimeout="auto">
+    <Say voice="alice">I have not received any input. Please tell your query in a few words.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
   }
 
-  // ── Menu step (no input or invalid digit) ───────────────────
-  if (attempt >= 2) {
-    markDisconnected();
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Sorry, no option selected. Please try again. Thank you for calling BrightSuite. Goodbye.</Say>
-  <Hangup/>
-</Response>`);
-  }
-
-  // First reprompt — "you have not selected any option"
-  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}&attempt=2`);
+  // step === "menu"
+  const menuUrl    = escapeXml(`${BASE_URL}/api/twilio/ivr-menu?call_id=${callId}`);
   const noInputUrl = escapeXml(`${BASE_URL}/api/twilio/ivr-noinput?call_id=${callId}&step=menu&attempt=2`);
   return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="dtmf" action="${menuUrl}" method="POST" timeout="8" numDigits="1">
-    <Say voice="alice">You have not selected any option, please choose one option. For Billing press 1, for Service press 2, for New Connection press 3, for General queries press 4.</Say>
+  <Gather input="dtmf speech" action="${menuUrl}" method="POST" timeout="8" numDigits="1" speechTimeout="auto">
+    <Say voice="alice">I have not received any input. For Billing press 1, for New Lines or New Services press 2, for Service related Queries press 3. Or please tell me how I can help you.</Say>
   </Gather>
   <Redirect method="POST">${noInputUrl}</Redirect>
 </Response>`);
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
+// Recording starts automatically via record="record-from-start" in the TwiML.
+// Twilio fires recordingStatusCallback when recording completes.
 app.post("/api/twilio/agent", (req, res) => {
   res.set("Content-Type", "text/xml");
 
@@ -858,10 +711,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
     priority:       "low",
   }).then(({ error }) => {
     if (error) console.error("[outbound] Call insert error:", error.message);
-    else {
-      console.log(`[outbound] Call inserted in DB ✓`);
-      supabase.from("calls").update({ call_type: "outbound" }).eq("id", callId).then(() => {});
-    }
+    else console.log(`[outbound] Call inserted in DB ✓`);
   });
 
   lookupCustomerByPhone(to).then((customer) => {
@@ -880,7 +730,6 @@ app.post("/api/twilio/outbound", async (req, res) => {
 
   // Put agent into the conference room with transcription
   const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  // end event tracks disconnect; role=agent is not used for recording on outbound (customer join triggers it).
   const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -894,8 +743,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
                 statusCallbackEvent="end"
-                statusCallback="${statusUrl}"
-                statusCallbackMethod="POST">
+                statusCallback="${statusUrl}">
       ${room}
     </Conference>
   </Dial>
@@ -909,10 +757,8 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
   const callId = String(req.query.call_id || "").trim();
   if (!callId) return res.send("<Response><Hangup/></Response>");
 
-  const room                     = `room-${callId}`;
+  const room                    = `room-${callId}`;
   const customerTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
-  // role=customer tells the handler to start recording when the outbound customer picks up.
-  const statusUrl                = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}&role=customer`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -922,163 +768,23 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl=""
-                statusCallbackEvent="join"
-                statusCallback="${statusUrl}"
-                statusCallbackMethod="POST">
+    <Conference beep="false" waitUrl="">
       ${room}
     </Conference>
   </Dial>
 </Response>`);
 });
 
-// -- Agent dial status callback (fired when agent call ends/fails) -
-// Handles no-answer/busy/failed by first trying the general pool,
-// then redirecting the waiting customer if still no one picks up.
-// -- Agent dial status callback --------------------------------
-// attempt=1 or 2 → play "agents busy, please wait" and re-dial
-// attempt=3      → all retries exhausted, disconnect customer
-app.post("/api/twilio/agent-status", async (req, res) => {
-  res.status(200).end();
-
-  const callId   = String(req.query.call_id  || "").trim();
-  const identity = String(req.query.identity || "").trim();
-  const category = String(req.query.category || "general").trim();
-  const attempt  = parseInt(req.query.attempt || "1", 10);
-  const status   = String(req.body.CallStatus || "").trim();
-
-  console.log(`[agent-status] callId=${callId} identity=${identity} category=${category} attempt=${attempt} status=${status}`);
-
-  if (!callId || !twilioClient) return;
-  if (!["no-answer", "busy", "failed"].includes(status)) return;
-
-  if (attempt >= 3) {
-    console.log(`[agent-status] All attempts exhausted — disconnecting callId=${callId}`);
-    redirectCustomerToNoAgentMessage(callId);
-    return;
-  }
-
-  // Redirect customer to wait message; agent-waiting re-dials
-  console.log(`[agent-status] attempt=${attempt} — redirecting to wait message callId=${callId}`);
-  redirectCustomerTo(
-    callId,
-    `${BASE_URL}/api/twilio/agent-waiting?call_id=${callId}&category=${category}&attempt=${attempt}`
-  );
-});
-
-// -- Customer wait TwiML + agent re-dial ----------------------
-// Plays "agents are busy" message, puts customer back in conference,
-// then re-dials the agent pool after a short delay.
-app.post("/api/twilio/agent-waiting", (req, res) => {
-  res.set("Content-Type", "text/xml");
-
-  const callId   = String(req.query.call_id  || "").trim();
-  const category = String(req.query.category || "general").trim();
-  const attempt  = parseInt(req.query.attempt || "1", 10);
-
-  console.log(`[agent-waiting] callId=${callId} category=${category} attempt=${attempt}`);
-
-  if (twilioClient && TWILIO_PHONE_NUMBER && callId) {
-    const agentIdentity = categoryToAgentIdentity(category);
-    const agentUrl      = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-    setTimeout(() => {
-      twilioClient.calls.create({
-        to:   `client:${agentIdentity}`,
-        from: TWILIO_PHONE_NUMBER,
-        url:  agentUrl,
-        statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}&category=${category}&attempt=${attempt + 1}`,
-        statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
-        statusCallbackMethod: "POST",
-        timeout: 12,
-      }).then((call) => {
-        console.log(`[agent-waiting] Re-dialled agent ✓ SID=${call.sid} attempt=${attempt + 1}`);
-      }).catch((err) => {
-        console.error(`[agent-waiting] Re-dial FAILED: ${err.message}`);
-        redirectCustomerToNoAgentMessage(callId);
-      });
-    }, 3_000);
-  }
-
-  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
-  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
-  const room             = `room-${callId}`;
-
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Agents are busy on other calls. Please wait while we connect you.</Say>
-  <Start>
-    <Transcription statusCallbackUrl="${transcriptionUrl}"
-                   statusCallbackMethod="POST"
-                   track="inbound_track" />
-  </Start>
-  <Dial>
-    <Conference beep="false"
-                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="end"
-                statusCallback="${statusUrl}"
-                statusCallbackMethod="POST">
-      ${room}
-    </Conference>
-  </Dial>
-</Response>`);
-});
-
-// -- Twilio recording-status webhook (fires when Twilio recording completes) --
-app.post("/api/twilio/recording-status", async (req, res) => {
-  res.status(200).end();
-
-  const callId       = String(req.query.call_id            || "").trim();
-  const sid          = String(req.body.RecordingSid         || "").trim();
-  const status       = String(req.body.RecordingStatus      || "").trim();
-  const duration     = parseInt(req.body.RecordingDuration  || "0", 10);
-  const recordingUrl = String(req.body.RecordingUrl         || "").trim();
-
-  if (!callId || !sid) {
-    console.warn("[recording-status/twilio] Missing callId or RecordingSid — ignoring");
-    return;
-  }
-
-  console.log(`[recording-status/twilio] callId=${callId} sid=${sid} status=${status} duration=${isNaN(duration) ? "?" : duration}s`);
-
-  const { error } = await supabase.from("recordings").upsert({
-    call_id:          callId,
-    recording_sid:    sid,
-    recording_url:    recordingUrl || null,
-    duration_seconds: isNaN(duration) ? null : duration,
-    status,
-    completed_at:     status === "completed" ? new Date().toISOString() : null,
-  }, { onConflict: "recording_sid" });
-
-  if (error) console.error("[recording-status/twilio] Save error:", error.message);
-  else console.log(`[recording-status/twilio] ${status} recording saved ✓ sid=${sid}`);
-});
-
-// -- No-agent TwiML (played to customer when no agent answers) -
-app.post("/api/twilio/no-agent-available", (_req, res) => {
-  res.set("Content-Type", "text/xml");
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Agents are busy right now. Please try again after some time. Thank you for calling BrightSuite.</Say>
-  <Hangup/>
-</Response>`);
-});
-
-// -- Conference status callback (join → start recording; end → disconnect) ---
-// role=agent  in URL → fired when inbound agent joins  → start recording
-// role=customer in URL → fired when outbound customer joins → start recording
-// no role (or end event) → conference-end → mark call disconnected
+// -- Conference status callback (called when conference ends) -
 app.post("/api/conference-status", (req, res) => {
   res.status(200).end();
 
-  const callId        = String(req.query.call_id || "").trim();
-  const role          = String(req.query.role    || "").trim(); // "agent" | "customer" | ""
-  const event         = req.body.StatusCallbackEvent;
-  const conferenceSid = req.body.ConferenceSid;
-
-  console.log(`[conference-status] event=${event} role=${role} callId=${callId} confSid=${conferenceSid}`);
+  const callId        = String(req.query.call_id            || "").trim();
+  const event         = String(req.body.StatusCallbackEvent || "").trim();
+  const conferenceSid = String(req.body.ConferenceSid       || "").trim();
 
   if (event === "conference-end" && callId) {
-    console.log(`[conference-status] Conference ended callId=${callId}`);
+    console.log(`[conference-status] Conference ended callId=${callId} conferenceSid=${conferenceSid}`);
     supabase.from("calls").update({ status: "disconnected" })
       .eq("id", callId)
       .then(({ error }) => {
@@ -1086,8 +792,8 @@ app.post("/api/conference-status", (req, res) => {
         else console.log(`[conference-status] Call ${callId} marked disconnected ✓`);
       });
 
-    // Fallback: if the recordingStatusCallback webhook was missed,
-    // query Twilio directly 90 s after conference ends (enough time for encoding).
+    // Fallback: if the recordingStatusCallback webhook was missed (e.g. wrong BASE_URL),
+    // query Twilio REST API directly after 90 s (enough time for encoding to finish).
     if (twilioClient && conferenceSid) {
       setTimeout(async () => {
         try {
@@ -1115,73 +821,6 @@ app.post("/api/conference-status", (req, res) => {
       }, 90_000);
       console.log(`[recording-sync] Scheduled fallback recording sync in 90 s for callId=${callId}`);
     }
-  }
-});
-
-// -- Twilio recording-status callback (fires when recording completes/fails) -
-app.post("/api/recording-status", async (req, res) => {
-  res.status(200).end();
-
-  const callId       = String(req.query.call_id || "").trim();
-  const recordingSid = req.body.RecordingSid;
-  const recStatus    = req.body.RecordingStatus; // "completed" | "failed" | "absent"
-  const recUrl       = req.body.RecordingUrl;
-  const duration     = parseInt(req.body.RecordingDuration || "0", 10);
-
-  console.log(`[recording-status] callId=${callId} sid=${recordingSid} status=${recStatus} duration=${duration}s`);
-
-  if (!recordingSid) return;
-
-  if (recStatus === "completed") {
-    const url = recUrl ? `${recUrl}.mp3` : null;
-    const { error } = await supabase.from("recordings").update({
-      status:           "completed",
-      recording_url:    url,
-      duration_seconds: isNaN(duration) ? null : duration,
-      completed_at:     new Date().toISOString(),
-    }).eq("recording_sid", recordingSid);
-    if (error) console.error("[recording-status] DB update error:", error.message);
-    else console.log(`[recording-status] Recording completed ✓ ${recordingSid}`);
-  } else if (recStatus === "failed" || recStatus === "absent") {
-    await supabase.from("recordings").update({ status: "failed" })
-      .eq("recording_sid", recordingSid);
-    console.warn(`[recording-status] Recording failed: ${recordingSid}`);
-  }
-});
-
-// -- Fetch recordings for a call ----------------------------
-app.get("/api/recordings", async (req, res) => {
-  const callId = String(req.query.call_id || "").trim();
-  if (!callId) return res.status(400).json({ error: "call_id required" });
-
-  const { data, error } = await supabase
-    .from("recordings")
-    .select("*")
-    .eq("call_id", callId)
-    .order("created_at", { ascending: true });
-
-  if (error) return res.status(500).json({ error: error.message });
-  return res.json({ recordings: data || [] });
-});
-
-// -- Proxy recording audio from Twilio (requires Basic Auth) -
-// Browser audio player can't add auth headers, so we proxy the MP3 here.
-app.get("/api/recordings/:sid/audio", async (req, res) => {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(503).end();
-  const sid  = req.params.sid;
-  const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
-  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-  try {
-    const tRes = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
-    if (!tRes.ok) { console.warn(`[recording-audio] Twilio ${tRes.status} for ${sid}`); return res.status(tRes.status).end(); }
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "private, max-age=3600");
-    const buf = Buffer.from(await tRes.arrayBuffer());
-    res.send(buf);
-  } catch (err) {
-    console.error("[recording-audio] Fetch error:", err.message);
-    res.status(502).end();
   }
 });
 
@@ -1384,18 +1023,7 @@ app.post("/api/call/mute", (req, res) => {
 // -- Call summary: AI-generated summary of the conversation ---
 app.get("/api/call-summary", async (req, res) => {
   const callId = String(req.query.call_id || "").trim();
-  const force  = req.query.force === "true";
   if (!callId) return res.status(400).json({ error: "call_id required" });
-
-  // Return cached AI summary immediately unless the caller forced a refresh
-  if (!force) {
-    const { data: callRow } = await supabase
-      .from("calls").select("summary_json").eq("id", callId).maybeSingle();
-    if (callRow?.summary_json) {
-      console.log(`[call-summary] Returning cached summary for callId=${callId}`);
-      return res.json(callRow.summary_json);
-    }
-  }
 
   try {
     const [{ data: msgs }, { data: analyses }] = await Promise.all([
@@ -1416,142 +1044,52 @@ app.get("/api/call-summary", async (req, res) => {
       message_count: { customer: customerCt, agent: agentCt },
     };
 
-    const empty = {
-      ...base,
-      topic: "Awaiting customer", summary: null,
-      key_points: [], customer_insights: [], rep_insights: [], pending_items: [],
-      overall_sentiment: "neutral", sentiment_timeline: [], agent_attributes: null,
-      status: "pending",
-    };
-
-    if (allMsgs.length === 0) return res.json(empty);
-
-    // Build transcript with per-message relative timestamps (minutes from first message)
-    const callStartMs = new Date(allMsgs[0].created_at).getTime();
-    const transcriptWithTimes = allMsgs.map((m) => {
-      const min = Math.floor((new Date(m.created_at).getTime() - callStartMs) / 60_000);
-      return `[${min}m] ${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`;
-    }).join("\n");
-
-    const callDurationMin = allMsgs.length > 1
-      ? Math.ceil((new Date(allMsgs[allMsgs.length - 1].created_at).getTime() - callStartMs) / 60_000)
-      : 0;
-
-    const prompt = `You are summarizing a call center conversation for an agent dashboard.
-
-Transcript (timestamps are minutes from call start):
-${transcriptWithTimes}
-${latest ? `\nLast detected: emotion=${latest.emotion}, intent=${latest.intent}, priority=${latest.priority}` : ""}
-
-Return ONLY valid JSON, no markdown, no code fences. Use exactly this structure:
-{
-  "topic": "2-6 word label for the main issue",
-  "summary": "2-3 sentences describing what happened on the call",
-  "key_points": ["specific fact or figure mentioned", "another key fact"],
-  "status": "in_progress|resolved|escalated|pending",
-  "customer_insights": ["what the customer wanted or discussed — bullet 1", "bullet 2", "bullet 3"],
-  "rep_insights": ["what the agent/rep provided or said — bullet 1", "bullet 2", "bullet 3"],
-  "pending_items": ["topic or question the rep did NOT address or resolve — bullet 1", "bullet 2"],
-  "overall_sentiment": "positive|neutral|negative",
-  "sentiment_timeline": [
-    {"minute": 0, "score": 0.7, "emotion": "calm"}
-  ],
-  "agent_attributes": {
-    "audio_pause": true,
-    "audio_speed": true,
-    "respect": true,
-    "empathy": true,
-    "politeness": true,
-    "clarity": true,
-    "confidence": true,
-    "engagement": true,
-    "professionalism": true,
-    "patience": true,
-    "knowledge": false
-  }
-}
-
-Rules:
-- sentiment_timeline: one entry per minute from 0 to ${callDurationMin}. score is 0.0 (very angry) to 1.0 (very happy/satisfied). emotion is one of: calm, frustrated, confused, angry, satisfied.
-- agent_attributes: evaluate each attribute based solely on agent messages. If no agent messages exist, set all to null.
-- customer_insights / rep_insights / pending_items: 2-4 concise bullet points each. If no agent was present, rep_insights = [] and pending_items = ["Agent not yet joined"].
-`;
-
-    const key = process.env.GEMINI_API_KEY;
-    let parsed = {};
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20_000);
-      let gRes;
-      try {
-        gRes = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({
-            contents:         [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 1000, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
-          }),
-          signal: controller.signal,
-        });
-      } finally { clearTimeout(timer); }
-
-      if (!gRes.ok) throw new Error(`Gemini ${gRes.status}`);
-      const gData = await gRes.json();
-      const raw   = gData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
-      // Cache the successful Gemini response so future loads are instant
-      const toCache = {
-        ...base,
-        topic:              parsed.topic              || base.intent,
-        summary:            parsed.summary            || null,
-        key_points:         Array.isArray(parsed.key_points)         ? parsed.key_points.filter(Boolean)         : [],
-        status:             parsed.status             || "in_progress",
-        customer_insights:  Array.isArray(parsed.customer_insights)  ? parsed.customer_insights.filter(Boolean)  : [],
-        rep_insights:       Array.isArray(parsed.rep_insights)       ? parsed.rep_insights.filter(Boolean)       : [],
-        pending_items:      Array.isArray(parsed.pending_items)      ? parsed.pending_items.filter(Boolean)      : [],
-        overall_sentiment:  parsed.overall_sentiment  || "neutral",
-        sentiment_timeline: Array.isArray(parsed.sentiment_timeline) ? parsed.sentiment_timeline                 : [],
-        agent_attributes:   parsed.agent_attributes   || null,
-      };
-      supabase.from("calls").update({ summary_json: toCache }).eq("id", callId)
-        .then(({ error }) => {
-          if (error) console.error("[call-summary] Cache save error:", error.message);
-          else console.log(`[call-summary] Summary cached for callId=${callId}`);
-        });
-    } catch (geminiErr) {
-      console.error("[call-summary] Gemini error (returning base data):", geminiErr.message);
+    if (allMsgs.length === 0) {
+      return res.json({ ...base, topic: "Awaiting customer", summary: null, key_points: [], status: "pending" });
     }
 
-    // Build a fallback summary from the raw transcript when Gemini fails or skips it
-    if (!parsed.summary) {
-      const customerLines = allMsgs.filter((m) => m.role === "user").map((m) => m.content.trim());
-      const agentLines    = allMsgs.filter((m) => m.role === "agent").map((m) => m.content.trim());
-      const topic         = parsed.topic || base.intent.replace(/_/g, " ");
+    const transcript = allMsgs
+      .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
+      .join("\n");
 
-      let fallback = `The customer contacted support regarding ${topic}.`;
-      if (customerLines.length > 0) {
-        fallback += ` The customer said: "${customerLines.slice(0, 2).join(" ")}".`;
-      }
-      if (agentLines.length > 0) {
-        fallback += ` The agent responded: "${agentLines.slice(0, 2).join(" ")}".`;
-      } else {
-        fallback += " The agent has not yet responded on this call.";
-      }
-      parsed.summary = fallback;
-    }
+    const prompt = [
+      "You are summarizing a call center conversation for an agent dashboard.",
+      "",
+      "Conversation transcript:",
+      transcript,
+      "",
+      latest ? `Most recent analysis — emotion: ${latest.emotion}, intent: ${latest.intent}, priority: ${latest.priority}` : "",
+      "",
+      "Return ONLY valid JSON — no markdown, no code blocks:",
+      JSON.stringify({
+        topic:      "<2-6 word label for the main issue, e.g. 'High electricity bill inquiry'>",
+        summary:    "<2-3 sentences describing what the call is about and what has been established>",
+        key_points: ["<key fact 1 e.g. specific amount or date>", "<key fact 2>", "<key fact 3>"],
+        status:     "<in_progress|resolved|escalated|pending>",
+      }),
+    ].filter(Boolean).join("\n");
+
+    const key      = process.env.GEMINI_API_KEY;
+    const gRes     = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        contents:         [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0.2 },
+      }),
+    });
+
+    if (!gRes.ok) throw new Error(`Gemini ${gRes.status}`);
+    const gData  = await gRes.json();
+    const raw    = gData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const parsed = JSON.parse(raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim());
 
     return res.json({
       ...base,
-      topic:              parsed.topic              || base.intent,
-      summary:            parsed.summary            || null,
-      key_points:         Array.isArray(parsed.key_points)         ? parsed.key_points.filter(Boolean)         : [],
-      status:             parsed.status             || "in_progress",
-      customer_insights:  Array.isArray(parsed.customer_insights)  ? parsed.customer_insights.filter(Boolean)  : [],
-      rep_insights:       Array.isArray(parsed.rep_insights)       ? parsed.rep_insights.filter(Boolean)       : [],
-      pending_items:      Array.isArray(parsed.pending_items)      ? parsed.pending_items.filter(Boolean)      : [],
-      overall_sentiment:  parsed.overall_sentiment  || "neutral",
-      sentiment_timeline: Array.isArray(parsed.sentiment_timeline) ? parsed.sentiment_timeline                 : [],
-      agent_attributes:   parsed.agent_attributes   || null,
+      topic:      parsed.topic      || base.intent,
+      summary:    parsed.summary    || null,
+      key_points: Array.isArray(parsed.key_points) ? parsed.key_points.filter(Boolean) : [],
+      status:     parsed.status     || "in_progress",
     });
   } catch (err) {
     console.error("[call-summary] error:", err.message);
@@ -1594,6 +1132,152 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
 
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
 app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
+
+// -- Agent dial status callback (fired when agent call ends/fails) -
+// Handles no-answer/busy/failed by first trying the general pool,
+// then redirecting the waiting customer if still no one picks up.
+app.post("/api/twilio/agent-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const identity = String(req.query.identity || "").trim();
+  const status   = String(req.body.CallStatus || "").trim();
+
+  console.log(`[agent-status] callId=${callId} identity=${identity} status=${status}`);
+
+  if (!callId || !twilioClient) return;
+  if (!["no-answer", "busy", "failed"].includes(status)) return;
+
+  if (identity !== "agent_general") {
+    // First failure — try the general pool as a fallback
+    console.log(`[agent-status] No answer from ${identity} — trying agent_general`);
+    const fallbackUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    twilioClient.calls.create({
+      to:   "client:agent_general",
+      from: TWILIO_PHONE_NUMBER,
+      url:  fallbackUrl,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=agent_general`,
+      statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+      statusCallbackMethod: "POST",
+      timeout: 8,
+    }).then((call) => {
+      console.log(`[agent-status] Fallback agent call created ✓ SID=${call.sid}`);
+    }).catch((err) => {
+      console.error(`[agent-status] Fallback dial FAILED: ${err.message}`);
+      redirectCustomerToNoAgentMessage(callId);
+    });
+  } else {
+    // General pool also failed — no agents available at all
+    console.log(`[agent-status] No agents available — redirecting customer callId=${callId}`);
+    redirectCustomerToNoAgentMessage(callId);
+  }
+});
+
+// -- Recording status callback (Twilio fires when conference recording completes) --
+app.post("/api/twilio/recording-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId       = String(req.query.call_id            || "").trim();
+  const sid          = String(req.body.RecordingSid         || "").trim();
+  const status       = String(req.body.RecordingStatus      || "").trim();
+  const duration     = parseInt(req.body.RecordingDuration  || "0", 10);
+  const recordingUrl = String(req.body.RecordingUrl         || "").trim();
+
+  if (!callId || !sid) {
+    console.warn("[recording-status] Missing callId or RecordingSid — ignoring");
+    return;
+  }
+
+  console.log(`[recording] callId=${callId} sid=${sid} status=${status} duration=${isNaN(duration) ? "?" : duration}s`);
+
+  const { error } = await supabase.from("recordings").upsert({
+    call_id:          callId,
+    recording_sid:    sid,
+    recording_url:    recordingUrl || null,
+    duration_seconds: isNaN(duration) ? null : duration,
+    status,
+    completed_at:     status === "completed" ? new Date().toISOString() : null,
+  }, { onConflict: "recording_sid" });
+
+  if (error) console.error("[recording] Save error:", error.message);
+  else console.log(`[recording] ${status} recording saved ✓ sid=${sid}`);
+});
+
+// -- Manual recording sync: pulls Twilio recordings into the DB ----------
+// Called from the dashboard "Sync" button when the webhook was missed.
+app.get("/api/recordings/sync", async (req, res) => {
+  if (!twilioClient) return res.status(503).json({ error: "Twilio not configured." });
+
+  try {
+    const recs = await twilioClient.recordings.list({ limit: 50 });
+    let synced = 0;
+
+    for (const rec of recs) {
+      if (!rec.conferenceSid) continue;
+
+      // Derive our internal callId from the conference friendly name (room-{callId})
+      let callId = null;
+      try {
+        const conf = await twilioClient.conferences(rec.conferenceSid).fetch();
+        const m = conf.friendlyName?.match(/^room-(.+)$/);
+        if (m) callId = m[1];
+      } catch { continue; }
+
+      if (!callId) continue;
+
+      const { error } = await supabase.from("recordings").upsert({
+        call_id:          callId,
+        recording_sid:    rec.sid,
+        recording_url:    rec.mediaUrl || null,
+        duration_seconds: rec.duration ? parseInt(String(rec.duration), 10) : null,
+        status:           rec.status,
+        completed_at:     rec.status === "completed" ? new Date().toISOString() : null,
+      }, { onConflict: "recording_sid" });
+
+      if (!error) synced++;
+      else console.error(`[recordings-sync] ${rec.sid}:`, error.message);
+    }
+
+    console.log(`[recordings-sync] Synced ${synced} of ${recs.length} recordings`);
+    return res.json({ ok: true, synced, total: recs.length });
+  } catch (err) {
+    console.error("[recordings-sync] Error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// -- Stream a Twilio recording to the browser (proxies with Basic Auth) --
+app.get("/api/recordings/stream/:sid", async (req, res) => {
+  const { sid } = req.params;
+  if (!sid || !sid.startsWith("RE")) return res.status(404).end();
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(503).end();
+
+  const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+
+  try {
+    const upstream = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+    if (!upstream.ok) return res.status(upstream.status).end();
+    const buffer = await upstream.arrayBuffer();
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", buffer.byteLength);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.end(Buffer.from(buffer));
+  } catch (err) {
+    console.error("[recording-stream] Error:", err.message);
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// -- No-agent TwiML (played to customer when no agent answers) -
+app.post("/api/twilio/no-agent-available", (_req, res) => {
+  res.set("Content-Type", "text/xml");
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We are sorry, but all agents are currently unavailable. Please call back during business hours or visit our website for assistance. Thank you for calling BrightSuite.</Say>
+  <Hangup/>
+</Response>`);
+});
 
 // ── Start server ──────────────────────────────────────────────
 function startServer(p) {
