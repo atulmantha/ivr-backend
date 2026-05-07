@@ -550,8 +550,56 @@ app.post("/api/twilio/voice", async (req, res) => {
   }
 });
 
-// -- IVR: identity verification (name only) -------------------
-// Validates name against the customers table; allows 2 attempts total.
+// -- DOB parsing helpers --------------------------------------
+function extractDobNumbers(speech) {
+  const monthMap = {
+    january:1, jan:1, february:2, feb:2, march:3, mar:3,
+    april:4, apr:4, may:5, june:6, jun:6,
+    july:7, jul:7, august:8, aug:8, september:9, sep:9, sept:9,
+    october:10, oct:10, november:11, nov:11, december:12, dec:12
+  };
+  const ordinalMap = {
+    first:1, second:2, third:3, fourth:4, fifth:5, sixth:6, seventh:7,
+    eighth:8, ninth:9, tenth:10, eleventh:11, twelfth:12, thirteenth:13,
+    fourteenth:14, fifteenth:15, sixteenth:16, seventeenth:17, eighteenth:18,
+    nineteenth:19, twentieth:20, thirtieth:30
+  };
+  let text = speech.toLowerCase().replace(/[,\/\-\.]/g, ' ');
+  // strip ordinal suffixes (1st, 2nd, 3rd, 11th …)
+  text = text.replace(/\b(\d+)(?:st|nd|rd|th)\b/g, '$1');
+  for (const [name, num] of Object.entries(monthMap)) {
+    text = text.replace(new RegExp(`\\b${name}\\b`, 'g'), ` ${num} `);
+  }
+  for (const [word, num] of Object.entries(ordinalMap)) {
+    text = text.replace(new RegExp(`\\b${word}\\b`, 'g'), ` ${num} `);
+  }
+  return (text.match(/\d+/g) || []).map(Number);
+}
+
+// Returns true if any ordering of nums (MDY / DMY / YMD) matches storedDobStr "YYYY-MM-DD"
+function dobMatchesAnyOrder(nums, storedDobStr) {
+  if (!storedDobStr || nums.length < 3) return false;
+  const parts = storedDobStr.split('-').map(Number);
+  if (parts.length < 3) return false;
+  const [sYear, sMon, sDay] = parts;
+
+  for (let yi = 0; yi < nums.length; yi++) {
+    const year = nums[yi];
+    if (year !== sYear) continue;
+    const rest = nums.filter((_, i) => i !== yi);
+    for (let ai = 0; ai < rest.length; ai++) {
+      for (let bi = 0; bi < rest.length; bi++) {
+        if (ai === bi) continue;
+        const [a, b] = [rest[ai], rest[bi]];
+        if ((a === sMon && b === sDay) || (a === sDay && b === sMon)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// -- IVR: identity verification (name + date of birth) --------
+// Validates name and DOB against the customers table; allows 2 attempts total.
 app.post("/api/twilio/ivr-verify", async (req, res) => {
   res.set("Content-Type", "text/xml");
   const callId  = String(req.query.call_id || "").trim();
@@ -560,27 +608,55 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  // Best-effort customer lookup — populates the call record but does NOT gate verification.
-  let matchedCustomer = null;
+  const speechLower = speech.toLowerCase();
+  const dobNums     = extractDobNumbers(speech);
+
+  // Fetch all customers; try with date_of_birth, fall back without if column missing
+  let allCustomers = [];
+  let dobColumnExists = true;
   try {
-    const speechLower = speech.toLowerCase();
-    const { data: allCustomers } = await supabase
-      .from("customers")
-      .select("id, name, tier, phone")
-      .limit(500);
-    for (const c of (allCustomers || [])) {
-      const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
-      if (nameParts.some(part => speechLower.includes(part))) {
-        matchedCustomer = c;
-        break;
-      }
+    const { data, error: qErr } = await supabase
+      .from("customers").select("id, name, tier, phone, date_of_birth").limit(500);
+    if (qErr) {
+      dobColumnExists = false;
+      const { data: fb } = await supabase
+        .from("customers").select("id, name, tier, phone").limit(500);
+      allCustomers = fb || [];
+    } else {
+      allCustomers = data || [];
     }
   } catch (err) {
     console.error("[ivr-verify] Customer lookup error:", err.message);
   }
 
-  const verified = true;
-  console.log(`[ivr-verify] verified=true (always pass) customer=${matchedCustomer?.name || "none"}`);
+  // Match by name first; if no name found in speech, match by DOB alone
+  let matchedCustomer = null;
+  for (const c of allCustomers) {
+    const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
+    if (nameParts.some(part => speechLower.includes(part))) {
+      matchedCustomer = c;
+      break;
+    }
+  }
+  if (!matchedCustomer && dobColumnExists && dobNums.length >= 3) {
+    for (const c of allCustomers) {
+      if (c.date_of_birth && dobMatchesAnyOrder(dobNums, c.date_of_birth)) {
+        matchedCustomer = c;
+        break;
+      }
+    }
+  }
+
+  // Verify DOB against matched customer's record
+  let verified = false;
+  if (matchedCustomer) {
+    if (!dobColumnExists || !matchedCustomer.date_of_birth) {
+      verified = true; // no DOB on record — pass
+    } else {
+      verified = dobMatchesAnyOrder(dobNums, matchedCustomer.date_of_birth);
+    }
+  }
+  console.log(`[ivr-verify] verified=${verified} customer=${matchedCustomer?.name || "none"} dob=${matchedCustomer?.date_of_birth || "none"}`);
 
   if (verified) {
     // Update call record with matched customer details

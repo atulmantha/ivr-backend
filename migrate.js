@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS recordings (
 -- Add call_type to calls (inbound vs outbound)
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_type TEXT DEFAULT 'inbound';
 
+-- Add date_of_birth to customers for IVR identity verification
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS date_of_birth DATE;
+
 -- Cache the AI-generated call summary so it only needs to be generated once
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS summary_json JSONB;
 
