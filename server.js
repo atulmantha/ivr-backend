@@ -608,46 +608,55 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  // Step 1: match customer by name (query without date_of_birth so it always works)
-  let matchedCustomer = null;
+  const speechLower = speech.toLowerCase();
+  const dobNums     = extractDobNumbers(speech);
+
+  // Fetch all customers; try with date_of_birth, fall back without if column missing
+  let allCustomers = [];
+  let dobColumnExists = true;
   try {
-    const speechLower = speech.toLowerCase();
-    const { data: allCustomers } = await supabase
-      .from("customers")
-      .select("id, name, tier, phone")
-      .limit(500);
-    for (const c of (allCustomers || [])) {
-      const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
-      if (nameParts.some(part => speechLower.includes(part))) {
-        matchedCustomer = c;
-        break;
-      }
+    const { data, error: qErr } = await supabase
+      .from("customers").select("id, name, tier, phone, date_of_birth").limit(500);
+    if (qErr) {
+      dobColumnExists = false;
+      const { data: fb } = await supabase
+        .from("customers").select("id, name, tier, phone").limit(500);
+      allCustomers = fb || [];
+    } else {
+      allCustomers = data || [];
     }
   } catch (err) {
     console.error("[ivr-verify] Customer lookup error:", err.message);
   }
 
-  // Step 2: fetch DOB separately (column may not exist yet — handle gracefully)
-  if (matchedCustomer) {
-    const { data: dobRow, error: dobErr } = await supabase
-      .from("customers")
-      .select("date_of_birth")
-      .eq("id", matchedCustomer.id)
-      .single();
-    matchedCustomer.date_of_birth = (!dobErr && dobRow) ? dobRow.date_of_birth : null;
+  // Match by name first; if no name found in speech, match by DOB alone
+  let matchedCustomer = null;
+  for (const c of allCustomers) {
+    const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
+    if (nameParts.some(part => speechLower.includes(part))) {
+      matchedCustomer = c;
+      break;
+    }
+  }
+  if (!matchedCustomer && dobColumnExists && dobNums.length >= 3) {
+    for (const c of allCustomers) {
+      if (c.date_of_birth && dobMatchesAnyOrder(dobNums, c.date_of_birth)) {
+        matchedCustomer = c;
+        break;
+      }
+    }
   }
 
-  // Step 3: verify DOB
+  // Verify DOB against matched customer's record
   let verified = false;
   if (matchedCustomer) {
-    if (!matchedCustomer.date_of_birth) {
+    if (!dobColumnExists || !matchedCustomer.date_of_birth) {
       verified = true; // no DOB on record — pass
     } else {
-      const dobNums = extractDobNumbers(speech);
       verified = dobMatchesAnyOrder(dobNums, matchedCustomer.date_of_birth);
     }
   }
-  console.log(`[ivr-verify] verified=${verified} customer=${matchedCustomer?.name || "none"} dob_on_record=${matchedCustomer?.date_of_birth || "none"}`);
+  console.log(`[ivr-verify] verified=${verified} customer=${matchedCustomer?.name || "none"} dob=${matchedCustomer?.date_of_birth || "none"}`);
 
   if (verified) {
     // Update call record with matched customer details
