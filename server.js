@@ -608,13 +608,13 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   console.log(`[ivr-verify] callId=${callId} attempt=${attempt} speech="${speech.slice(0, 80)}"`);
 
-  // Best-effort customer lookup — populates the call record but does NOT gate verification.
+  // Step 1: match customer by name (query without date_of_birth so it always works)
   let matchedCustomer = null;
   try {
     const speechLower = speech.toLowerCase();
     const { data: allCustomers } = await supabase
       .from("customers")
-      .select("id, name, tier, phone, date_of_birth")
+      .select("id, name, tier, phone")
       .limit(500);
     for (const c of (allCustomers || [])) {
       const nameParts = (c.name || "").toLowerCase().split(/\s+/).filter(p => p.length >= 3);
@@ -627,10 +627,21 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
     console.error("[ivr-verify] Customer lookup error:", err.message);
   }
 
+  // Step 2: fetch DOB separately (column may not exist yet — handle gracefully)
+  if (matchedCustomer) {
+    const { data: dobRow, error: dobErr } = await supabase
+      .from("customers")
+      .select("date_of_birth")
+      .eq("id", matchedCustomer.id)
+      .single();
+    matchedCustomer.date_of_birth = (!dobErr && dobRow) ? dobRow.date_of_birth : null;
+  }
+
+  // Step 3: verify DOB
   let verified = false;
   if (matchedCustomer) {
     if (!matchedCustomer.date_of_birth) {
-      verified = true; // no DOB on record — can't verify, so pass
+      verified = true; // no DOB on record — pass
     } else {
       const dobNums = extractDobNumbers(speech);
       verified = dobMatchesAnyOrder(dobNums, matchedCustomer.date_of_birth);
