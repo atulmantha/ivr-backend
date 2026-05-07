@@ -673,12 +673,12 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
   const dobNums     = extractDobNumbers(speech);
   console.log(`[ivr-verify] extracted dob nums: ${JSON.stringify(dobNums)}`);
 
-  // Fetch all customers; try with date_of_birth, fall back without if column missing
+  // Fetch all customers; try with dob, fall back without if column missing
   let allCustomers = [];
   let dobColumnExists = true;
   try {
     const { data, error: qErr } = await supabase
-      .from("customers").select("id, name, tier, phone, date_of_birth").limit(500);
+      .from("customers").select("id, name, tier, phone, dob").limit(500);
     if (qErr) {
       dobColumnExists = false;
       const { data: fb } = await supabase
@@ -702,7 +702,7 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
   }
   if (!matchedCustomer && dobColumnExists && dobNums.length >= 3) {
     for (const c of allCustomers) {
-      if (c.date_of_birth && dobMatchesAnyOrder(dobNums, c.date_of_birth)) {
+      if (c.dob && dobMatchesAnyOrder(dobNums, c.dob)) {
         matchedCustomer = c;
         break;
       }
@@ -712,13 +712,13 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
   // Verify DOB against matched customer's record
   let verified = false;
   if (matchedCustomer) {
-    if (!dobColumnExists || !matchedCustomer.date_of_birth) {
+    if (!dobColumnExists || !matchedCustomer.dob) {
       verified = true; // no DOB on record — pass
     } else {
-      verified = dobMatchesAnyOrder(dobNums, matchedCustomer.date_of_birth);
+      verified = dobMatchesAnyOrder(dobNums, matchedCustomer.dob);
     }
   }
-  console.log(`[ivr-verify] verified=${verified} customer=${matchedCustomer?.name || "none"} dob=${matchedCustomer?.date_of_birth || "none"}`);
+  console.log(`[ivr-verify] verified=${verified} customer=${matchedCustomer?.name || "none"} dob=${matchedCustomer?.dob || "none"}`);
 
   if (verified) {
     // Update call record with matched customer details
