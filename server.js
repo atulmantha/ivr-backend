@@ -558,34 +558,95 @@ function extractDobNumbers(speech) {
     july:7, jul:7, august:8, aug:8, september:9, sep:9, sept:9,
     october:10, oct:10, november:11, nov:11, december:12, dec:12
   };
+  // Compound ordinals must be replaced before single-word ones
+  const compoundOrdinals = {
+    'twenty first':21, 'twenty second':22, 'twenty third':23, 'twenty fourth':24,
+    'twenty fifth':25, 'twenty sixth':26, 'twenty seventh':27, 'twenty eighth':28,
+    'twenty ninth':29, 'thirty first':31
+  };
   const ordinalMap = {
     first:1, second:2, third:3, fourth:4, fifth:5, sixth:6, seventh:7,
     eighth:8, ninth:9, tenth:10, eleventh:11, twelfth:12, thirteenth:13,
     fourteenth:14, fifteenth:15, sixteenth:16, seventeenth:17, eighteenth:18,
     nineteenth:19, twentieth:20, thirtieth:30
   };
-  let text = speech.toLowerCase().replace(/[,\/\-\.]/g, ' ');
-  // strip ordinal suffixes (1st, 2nd, 3rd, 11th …)
+  // Cardinal number words (for spoken day/month values like "two" or "eleven")
+  const numberWords = {
+    one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9,
+    ten:10, eleven:11, twelve:12, thirteen:13, fourteen:14, fifteen:15,
+    sixteen:16, seventeen:17, eighteen:18, nineteen:19, twenty:20,
+    thirty:30
+  };
+  const tensMap  = { twenty:20, thirty:30, forty:40, fifty:50, sixty:60, seventy:70, eighty:80, ninety:90 };
+  const onesMap  = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9 };
+
+  let text = speech.toLowerCase();
+
+  // Written-out years: "nineteen eighty five" → 1985, "nineteen ninety" → 1990
+  text = text.replace(
+    /\bnineteen\s+(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:\s+(one|two|three|four|five|six|seven|eight|nine))?\b/g,
+    (_, tens, ones) => ` ${1900 + (tensMap[tens] || 0) + (ones ? (onesMap[ones] || 0) : 0)} `
+  );
+  // "two thousand [and] N" → 2000-2025
+  const twoThousandOnes = { one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,
+    ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,sixteen:16,
+    seventeen:17,eighteen:18,nineteen:19,twenty:20,'twenty one':21,'twenty two':22,
+    'twenty three':23,'twenty four':24,'twenty five':25 };
+  text = text.replace(
+    /\btwo thousand(?:\s+and)?\s+(twenty\s+(?:one|two|three|four|five)|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\b/g,
+    (_, n) => ` ${2000 + (twoThousandOnes[n.trim()] || 0)} `
+  );
+  text = text.replace(/\btwo thousand\b/g, ' 2000 ');
+
+  text = text.replace(/[,\/\-\.]/g, ' ');
+  // Strip ordinal suffixes: 11th → 11, 21st → 21
   text = text.replace(/\b(\d+)(?:st|nd|rd|th)\b/g, '$1');
+
+  // Replace in order: compound ordinals, then month names, then single ordinals, then cardinals
+  for (const [word, num] of Object.entries(compoundOrdinals)) {
+    text = text.replace(new RegExp(`\\b${word}\\b`, 'g'), ` ${num} `);
+  }
   for (const [name, num] of Object.entries(monthMap)) {
     text = text.replace(new RegExp(`\\b${name}\\b`, 'g'), ` ${num} `);
   }
   for (const [word, num] of Object.entries(ordinalMap)) {
     text = text.replace(new RegExp(`\\b${word}\\b`, 'g'), ` ${num} `);
   }
+  for (const [word, num] of Object.entries(numberWords)) {
+    text = text.replace(new RegExp(`\\b${word}\\b`, 'g'), ` ${num} `);
+  }
+
   return (text.match(/\d+/g) || []).map(Number);
 }
 
-// Returns true if any ordering of nums (MDY / DMY / YMD) matches storedDobStr "YYYY-MM-DD"
+// Returns true if any ordering of nums (MDY / DMY / YMD) matches the stored DOB.
+// Handles YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, and timestamps like "YYYY-MM-DDTHH:MM:SSZ".
 function dobMatchesAnyOrder(nums, storedDobStr) {
   if (!storedDobStr || nums.length < 3) return false;
-  const parts = storedDobStr.split('-').map(Number);
-  if (parts.length < 3) return false;
-  const [sYear, sMon, sDay] = parts;
+
+  // Strip time portion if Supabase returns a timestamp instead of a plain date
+  const s = String(storedDobStr).split('T')[0].trim();
+
+  let sYear, sMon, sDay;
+  let m;
+
+  // YYYY-MM-DD (standard Supabase DATE return format)
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) { sYear = +m[1]; sMon = +m[2]; sDay = +m[3]; }
+
+  // YYYY/MM/DD
+  if (!sYear) { m = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/); if (m) { sYear=+m[1]; sMon=+m[2]; sDay=+m[3]; } }
+
+  // DD/MM/YYYY or DD-MM-YYYY (non-ISO, treat as day/month/year)
+  if (!sYear) { m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/); if (m) { sDay=+m[1]; sMon=+m[2]; sYear=+m[3]; } }
+
+  if (!sYear || !sMon || !sDay) {
+    console.warn(`[ivr-verify] Cannot parse stored DOB format: "${storedDobStr}"`);
+    return false;
+  }
 
   for (let yi = 0; yi < nums.length; yi++) {
-    const year = nums[yi];
-    if (year !== sYear) continue;
+    if (nums[yi] !== sYear) continue;
     const rest = nums.filter((_, i) => i !== yi);
     for (let ai = 0; ai < rest.length; ai++) {
       for (let bi = 0; bi < rest.length; bi++) {
@@ -610,6 +671,7 @@ app.post("/api/twilio/ivr-verify", async (req, res) => {
 
   const speechLower = speech.toLowerCase();
   const dobNums     = extractDobNumbers(speech);
+  console.log(`[ivr-verify] extracted dob nums: ${JSON.stringify(dobNums)}`);
 
   // Fetch all customers; try with date_of_birth, fall back without if column missing
   let allCustomers = [];
