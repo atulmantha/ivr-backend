@@ -126,6 +126,9 @@ ALTER TABLE customers ADD COLUMN IF NOT EXISTS dob DATE;
 -- Cache the AI-generated call summary so it only needs to be generated once
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS summary_json JSONB;
 
+-- Queue support: track when a call entered the waiting queue
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS queue_entered_at TIMESTAMPTZ;
+
 -- agents (authenticated call center agents)
 CREATE TABLE IF NOT EXISTS agents (
   id           UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
