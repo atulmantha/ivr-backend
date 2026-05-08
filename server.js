@@ -22,6 +22,7 @@ const { analyzeCustomerSpeech }                            = require("./decision
 const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
 const { runMigrations }                                    = require("./migrate");
+const callQueue                                            = require("./queueManager");
 const authRoutes                                           = require("./authRoutes");
 require("dotenv").config({ quiet: true });
 
@@ -424,6 +425,56 @@ async function redirectCustomerTo(callId, url) {
 
 function redirectCustomerToNoAgentMessage(callId) {
   return redirectCustomerTo(callId, `${BASE_URL}/api/twilio/no-agent-available`);
+}
+
+// ── Queue: connect next waiting caller when an agent becomes free ──
+// Called after a conference ends. Walks the queue for `category`,
+// skipping any entries whose call was already disconnected, then
+// dials the agent for the first still-waiting call.
+async function processNextInQueue(category) {
+  if (!twilioClient || !TWILIO_PHONE_NUMBER) return;
+  try {
+    while (true) {
+      const entry = callQueue.dequeue(category);
+      if (!entry) break; // queue empty for this category
+
+      const { callId: nextId } = entry;
+
+      // Skip if the customer already hung up while waiting
+      const { data: callData } = await supabase
+        .from("calls").select("status").eq("id", nextId).maybeSingle();
+      if (!callData || callData.status !== "waiting") {
+        console.log(`[queue] Skipping ${nextId} — status is ${callData?.status || "unknown"}`);
+        continue;
+      }
+
+      // Mark the call active and announce connection to the customer
+      supabase.from("calls").update({ status: "active" }).eq("id", nextId).then(() => {});
+      redirectCustomerTo(nextId, `${BASE_URL}/api/twilio/queue-connecting?call_id=${nextId}`);
+
+      const agentIdentity = categoryToAgentIdentity(category);
+      console.log(`[queue] Dialling ${agentIdentity} for queued callId=${nextId} (category=${category})`);
+      twilioClient.calls.create({
+        to:   `client:${agentIdentity}`,
+        from: TWILIO_PHONE_NUMBER,
+        url:  `${BASE_URL}/api/twilio/agent?call_id=${nextId}`,
+        statusCallback:       `${BASE_URL}/api/twilio/queue-agent-status?call_id=${nextId}&category=${category}`,
+        statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+        statusCallbackMethod: "POST",
+        timeout: 20,
+      }).then((call) => {
+        console.log(`[queue] Agent call created for queued ${nextId} ✓ SID=${call.sid}`);
+      }).catch((err) => {
+        console.error(`[queue] Agent dial error for ${nextId}: ${err.message}`);
+        // Re-enqueue and revert status on dial failure
+        callQueue.enqueue(nextId, category);
+        supabase.from("calls").update({ status: "waiting" }).eq("id", nextId).then(() => {});
+      });
+      break; // only process one call at a time
+    }
+  } catch (err) {
+    console.error("[queue] processNextInQueue error:", err.message);
+  }
 }
 
 // -- Twilio Access Token for agent browser softphone ----------
@@ -1091,8 +1142,21 @@ app.post("/api/twilio/agent-status", async (req, res) => {
   if (!["no-answer", "busy", "failed"].includes(status)) return;
 
   if (attempt >= 3) {
-    console.log(`[agent-status] All attempts exhausted — disconnecting callId=${callId}`);
-    redirectCustomerToNoAgentMessage(callId);
+    // All retries exhausted — enqueue the customer instead of hanging up
+    const position = callQueue.enqueue(callId, category);
+    console.log(`[agent-status] All retries exhausted — queuing callId=${callId} pos=${position} category=${category}`);
+
+    // Persist waiting status and queue entry time
+    supabase.from("calls")
+      .update({ status: "waiting", queue_entered_at: new Date().toISOString() })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[agent-status] Queue DB update:", error.message); });
+
+    // Redirect customer to queue-hold TwiML (plays position announcement + hold music)
+    redirectCustomerTo(
+      callId,
+      `${BASE_URL}/api/twilio/queue-hold?call_id=${callId}&category=${category}&position=${position}`
+    );
     return;
   }
 
@@ -1201,6 +1265,113 @@ app.post("/api/twilio/no-agent-available", (_req, res) => {
 </Response>`);
 });
 
+// -- Queue hold TwiML: announces position + keeps customer on hold -
+// Played after a customer is enqueued (agent retries exhausted).
+app.post("/api/twilio/queue-hold", (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const category = String(req.query.category || "general").trim();
+  const position = parseInt(req.query.position || "1", 10);
+
+  console.log(`[queue-hold] callId=${callId} category=${category} position=${position}`);
+
+  const posText = position === 1
+    ? "You are next in line"
+    : `You are number ${position} in the queue`;
+
+  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  const room             = `room-${callId}`;
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">All our agents are currently assisting other customers. ${escapeXml(posText)}. Please stay on the line and we will connect you shortly.</Say>
+  <Start>
+    <Transcription statusCallbackUrl="${transcriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
+  <Dial>
+    <Conference beep="false"
+                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                statusCallbackEvent="end"
+                statusCallback="${statusUrl}"
+                statusCallbackMethod="POST">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`);
+});
+
+// -- Queue connecting TwiML: tells customer an agent is joining -
+// Played when a queued call is dequeued and the agent is being dialled.
+app.post("/api/twilio/queue-connecting", (req, res) => {
+  res.set("Content-Type", "text/xml");
+
+  const callId = String(req.query.call_id || "").trim();
+  console.log(`[queue-connecting] callId=${callId}`);
+
+  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  const room             = `room-${callId}`;
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">An agent is now available. Connecting you now. Thank you for your patience.</Say>
+  <Start>
+    <Transcription statusCallbackUrl="${transcriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
+  <Dial>
+    <Conference beep="false"
+                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                statusCallbackEvent="end"
+                statusCallback="${statusUrl}"
+                statusCallbackMethod="POST">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`);
+});
+
+// -- Queue timeout TwiML: played when a customer waits too long -
+app.post("/api/twilio/queue-timeout", (_req, res) => {
+  res.set("Content-Type", "text/xml");
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We apologise for the long wait. All agents are still unavailable. Please call back later. Thank you for your patience. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+});
+
+// -- Queue agent-status: handles agent response for dequeued calls -
+// If agent doesn't answer, the call is re-enqueued.
+app.post("/api/twilio/queue-agent-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const category = String(req.query.category || "general").trim();
+  const status   = String(req.body.CallStatus || "").trim();
+
+  console.log(`[queue-agent-status] callId=${callId} category=${category} status=${status}`);
+
+  if (!callId || !twilioClient) return;
+  if (!["no-answer", "busy", "failed"].includes(status)) return;
+
+  // Re-enqueue the call so it doesn't lose its place entirely
+  const position = callQueue.enqueue(callId, category);
+  supabase.from("calls").update({ status: "waiting" }).eq("id", callId).then(() => {});
+
+  // Re-announce updated position to the customer
+  redirectCustomerTo(
+    callId,
+    `${BASE_URL}/api/twilio/queue-hold?call_id=${callId}&category=${category}&position=${position}`
+  );
+  console.log(`[queue-agent-status] Re-queued callId=${callId} position=${position}`);
+});
+
 // -- Conference status callback (join → start recording; end → disconnect) ---
 // role=agent  in URL → fired when inbound agent joins  → start recording
 // role=customer in URL → fired when outbound customer joins → start recording
@@ -1216,12 +1387,33 @@ app.post("/api/conference-status", (req, res) => {
   console.log(`[conference-status] event=${event} role=${role} callId=${callId} confSid=${conferenceSid}`);
 
   if (event === "conference-end" && callId) {
+    // Remove from queue first in case the customer hung up while waiting
+    const removedCat = callQueue.remove(callId);
+    if (removedCat) {
+      console.log(`[conference-status] Removed ${callId} from ${removedCat} queue (hung up while waiting)`);
+    }
+
     console.log(`[conference-status] Conference ended callId=${callId}`);
     supabase.from("calls").update({ status: "disconnected" })
       .eq("id", callId)
-      .then(({ error }) => {
-        if (error) console.error("[conference-status] Status update:", error.message);
-        else console.log(`[conference-status] Call ${callId} marked disconnected ✓`);
+      .then(async ({ error }) => {
+        if (error) { console.error("[conference-status] Status update:", error.message); return; }
+        console.log(`[conference-status] Call ${callId} marked disconnected ✓`);
+
+        // Process next waiting call in the same category
+        try {
+          const { data: callData } = await supabase
+            .from("calls")
+            .select("ivr_category, call_type")
+            .eq("id", callId)
+            .maybeSingle();
+          if (callData?.ivr_category && callData.call_type !== "outbound") {
+            // Small delay so any in-flight Twilio state settles before we dial again
+            setTimeout(() => processNextInQueue(callData.ivr_category), 800);
+          }
+        } catch (e) {
+          console.error("[conference-status] Queue-next lookup error:", e.message);
+        }
       });
 
     // Fallback: if the recordingStatusCallback webhook was missed,
@@ -1732,6 +1924,24 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
 
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
 app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
+
+// -- Queue stats (dashboard) ----------------------------------
+// Returns per-category waiting counts and per-call wait times.
+app.get("/api/queue/stats", (_req, res) => {
+  res.json(callQueue.getStats());
+});
+
+// ── Queue timeout cleanup ─────────────────────────────────────
+// Every 2 minutes: disconnect calls that have waited > QUEUE_TIMEOUT_MS.
+setInterval(async () => {
+  const timedOut = callQueue.getTimedOut();
+  for (const entry of timedOut) {
+    callQueue.remove(entry.callId);
+    console.log(`[queue] Timeout: callId=${entry.callId} waited ${Math.floor((Date.now() - entry.enqueuedAt) / 1000)}s`);
+    supabase.from("calls").update({ status: "disconnected" }).eq("id", entry.callId).then(() => {});
+    redirectCustomerTo(entry.callId, `${BASE_URL}/api/twilio/queue-timeout?call_id=${entry.callId}`);
+  }
+}, 2 * 60 * 1000);
 
 // ── Start server ──────────────────────────────────────────────
 function startServer(p) {
