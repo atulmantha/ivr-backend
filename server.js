@@ -277,6 +277,7 @@ async function runAnalysisPipeline(callId, transcript) {
       .select("created_at")
       .eq("call_id", callId)
       .neq("intent", "call_greeting")
+      .neq("intent", "call_closing")
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -364,6 +365,35 @@ async function runAnalysisPipeline(callId, transcript) {
         });
       } else {
         console.warn("[analysis] generateSuggestedReply returned empty string");
+      }
+
+      // Auto-generate a closing message when the customer signals the conversation is wrapping up
+      const CLOSING_SIGNALS = /\b(thank(s| you)|that'?s (fine|all|good|great|perfect|it|all i needed)|no (more|other|further) (questions?|issues?|concerns?|help|assistance)|nothing else|that'?ll (do|be all)|all good|sounds? good|issue (is )?resolved|bye|goodbye|take care)\b/i;
+      if (CLOSING_SIGNALS.test(fullTranscript) && conversationHistory.length >= 2) {
+        const { data: existingClosing } = await supabase
+          .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
+        if (!existingClosing) {
+          try {
+            const transcript = conversationHistory
+              .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
+              .join("\n");
+            const originalIssue = conversationHistory.find((m) => m.role === "user")?.content?.slice(0, 150) || null;
+            const closingMsg = await generateClosingMessage(customerName, tier, transcript, originalIssue);
+            if (closingMsg) {
+              await supabase.from("analysis").insert({
+                call_id:           callId,
+                emotion:           "calm",
+                intent:            "call_closing",
+                priority:          "low",
+                suggested_actions: [],
+                suggested_reply:   closingMsg,
+              });
+              console.log(`[analysis] Closing message auto-generated for callId=${callId}`);
+            }
+          } catch (closingErr) {
+            console.error("[analysis] Closing message generation failed:", closingErr.message);
+          }
+        }
       }
     } catch (replyErr) {
       console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
