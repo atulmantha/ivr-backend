@@ -180,4 +180,50 @@ async function generateSuggestedReply(
   return (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 }
 
-module.exports = { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting };
+async function generateClosingMessage(customerName, tier = "Regular", transcriptSnippet, resolvedIntent) {
+  const name = String(customerName || "").trim();
+  const firstName = name.split(" ")[0] || null;
+
+  const prompt = [
+    `You are a call center agent wrapping up a support call with a ${tier} tier customer.`,
+    name ? `Customer name: ${name}` : "",
+    resolvedIntent ? `The customer originally called about: ${resolvedIntent}` : "",
+    transcriptSnippet ? `Recent conversation:\n${transcriptSnippet}` : "",
+    "",
+    "Write a short, professional closing message for the agent to say to end the call.",
+    "Rules:",
+    "- 2–3 sentences maximum.",
+    firstName ? `- Address the customer by first name (${firstName}).` : "- Do not address the customer by name.",
+    "- Acknowledge the issue was resolved.",
+    "- Thank them for contacting support.",
+    "- Ask if they need any further assistance.",
+    "- End politely and professionally.",
+    "- Voice-friendly: warm and natural, not robotic.",
+    "- Do NOT mention any company name.",
+    "Return only the closing message text — no labels, no quotes, no preamble.",
+  ].filter(Boolean).join("\n");
+
+  const key = process.env.GEMINI_API_KEY;
+  const fallback = firstName
+    ? `I'm glad we could get that resolved for you, ${firstName}. Thank you so much for calling — is there anything else I can help you with today?`
+    : "I'm glad we could resolve that for you. Thank you for calling — is there anything else I can help you with today?";
+
+  try {
+    const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 120, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
+      }),
+    });
+    if (!res.ok) throw new Error(`Gemini API ${res.status}`);
+    const data = await res.json();
+    const text = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    return text || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+module.exports = { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting, generateClosingMessage };
