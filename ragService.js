@@ -180,31 +180,26 @@ async function generateSuggestedReply(
   return (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 }
 
-async function generateClosingMessage(customerName, tier = "Regular") {
+async function generateClosingMessage(customerName) {
   const name = String(customerName || "").trim();
   const firstName = name.split(" ")[0] || null;
 
   const prompt = [
-    `You are a call center agent ending a support call with a ${tier} tier customer.`,
-    firstName ? `Address the customer as ${firstName}.` : "",
+    "You are a call center agent.",
+    "Write exactly one closing line for the agent to say after resolving the customer's issue.",
+    "The line must:",
+    `- Start with "I hope I resolved your query${firstName ? `, ${firstName}` : ""}"`,
+    "- Then ask if there is anything else you can assist with",
+    "- Be a single sentence — absolutely no more",
+    "- No thanks, no company names, no extra words",
     "",
-    "Write a single short closing sentence for the agent to say.",
-    "It must:",
-    "- Confirm the query has been answered",
-    "- Ask if there is anything else they can help with",
-    "- Be 1–2 sentences maximum — no more",
-    "- Sound natural and conversational, not formal or lengthy",
-    "- Do NOT include thanks, company names, or extra pleasantries",
+    `Required style: "I hope I resolved your query${firstName ? `, ${firstName}` : ""}. Is there anything else I can assist you with?"`,
     "",
-    `Example style: "I hope I've answered your queries today${firstName ? `, ${firstName}` : ""}. Is there anything else I can assist you with?"`,
-    "",
-    "Return only the closing line — no labels, no quotes, no preamble.",
+    "Return only that one line — no labels, no quotes.",
   ].filter(Boolean).join("\n");
 
   const key = process.env.GEMINI_API_KEY;
-  const fallback = firstName
-    ? `I'm glad we could get that resolved for you, ${firstName}. Thank you so much for contacting us — is there anything else I can help you with today?`
-    : "I'm glad we could resolve that for you. Thank you for contacting support — is there anything else I can help you with today?";
+  const fallback = `I hope I resolved your query${firstName ? `, ${firstName}` : ""}. Is there anything else I can assist you with?`;
 
   try {
     const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
@@ -212,7 +207,7 @@ async function generateClosingMessage(customerName, tier = "Regular") {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 120, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
+        generationConfig: { maxOutputTokens: 60, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
       }),
     });
     if (!res.ok) throw new Error(`Gemini API ${res.status}`);
@@ -224,4 +219,45 @@ async function generateClosingMessage(customerName, tier = "Regular") {
   }
 }
 
-module.exports = { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting, generateClosingMessage };
+async function generateFinalFarewell(customerName) {
+  const name = String(customerName || "").trim();
+  const firstName = name.split(" ")[0] || null;
+
+  const prompt = [
+    "You are a call center agent ending a call after the customer said they have no more questions.",
+    "Write a single short farewell line.",
+    "It must:",
+    "- Thank the customer for calling",
+    "- Wish them a nice day",
+    "- Be one sentence only — absolutely no more",
+    "- No company names, no extra pleasantries",
+    "",
+    `Required style: "Thank you for calling${firstName ? `, ${firstName}` : ""}. Have a nice day!"`,
+    "",
+    "Return only that one line — no labels, no quotes.",
+  ].filter(Boolean).join("\n");
+
+  const key = process.env.GEMINI_API_KEY;
+  const fallback = firstName
+    ? `Thank you for calling, ${firstName}. Have a nice day!`
+    : "Thank you for calling. Have a nice day!";
+
+  try {
+    const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 40, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
+      }),
+    });
+    if (!res.ok) throw new Error(`Gemini API ${res.status}`);
+    const data = await res.json();
+    const text = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    return text || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+module.exports = { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting, generateClosingMessage, generateFinalFarewell };
