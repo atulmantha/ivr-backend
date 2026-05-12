@@ -180,29 +180,25 @@ async function generateSuggestedReply(
   return (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 }
 
-async function generateClosingMessage(customerName, tier = "Regular", conversationTranscript, originalIssue) {
+async function generateClosingMessage(customerName, tier = "Regular") {
   const name = String(customerName || "").trim();
   const firstName = name.split(" ")[0] || null;
 
   const prompt = [
-    `You are a call center agent wrapping up a support call with a ${tier} tier customer.`,
-    name ? `Customer name: ${name}` : "",
-    originalIssue ? `The customer originally called about: ${originalIssue}` : "",
-    conversationTranscript ? `Conversation so far:\n${conversationTranscript}` : "",
+    `You are a call center agent ending a support call with a ${tier} tier customer.`,
+    firstName ? `Address the customer as ${firstName}.` : "",
     "",
-    "Based on the customer conversation and resolved issue, generate a short professional closing message for the agent to say.",
-    "The message should:",
-    "- Acknowledge the issue resolution",
-    "- Thank the customer for contacting support",
-    "- Ask if they need any further help",
-    "- End politely and professionally",
+    "Write a single short closing sentence for the agent to say.",
+    "It must:",
+    "- Confirm the query has been answered",
+    "- Ask if there is anything else they can help with",
+    "- Be 1–2 sentences maximum — no more",
+    "- Sound natural and conversational, not formal or lengthy",
+    "- Do NOT include thanks, company names, or extra pleasantries",
     "",
-    "Rules:",
-    "- 2–3 sentences maximum.",
-    firstName ? `- Address the customer by first name (${firstName}).` : "- Do not address the customer by name.",
-    "- Voice-friendly: warm and natural, not robotic.",
-    "- Do NOT mention any company name.",
-    "Return only the closing message text — no labels, no quotes, no preamble.",
+    `Example style: "I hope I've answered your queries today${firstName ? `, ${firstName}` : ""}. Is there anything else I can assist you with?"`,
+    "",
+    "Return only the closing line — no labels, no quotes, no preamble.",
   ].filter(Boolean).join("\n");
 
   const key = process.env.GEMINI_API_KEY;
