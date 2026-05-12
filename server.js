@@ -304,11 +304,7 @@ async function runAnalysisPipeline(callId, transcript) {
         .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
       if (!existingClosing) {
         try {
-          const transcriptText = conversationHistory
-            .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
-            .join("\n");
-          const originalIssue = conversationHistory.find((m) => m.role === "user")?.content?.slice(0, 150) || null;
-          const closingMsg = await generateClosingMessage(customerName, tier, transcriptText, originalIssue);
+          const closingMsg = await generateClosingMessage(customerName, tier);
           if (closingMsg) {
             await supabase.from("analysis").insert({
               call_id:           callId,
@@ -1957,22 +1953,13 @@ app.get("/api/closing-message", async (req, res) => {
   if (!callId) return res.status(400).json({ error: "call_id required" });
 
   try {
-    const [{ data: callRow }, { data: msgs }] = await Promise.all([
-      supabase.from("calls").select("customer_name, tier, ivr_category").eq("id", callId).maybeSingle(),
-      supabase.from("messages").select("role, content").eq("call_id", callId).order("created_at", { ascending: true }),
-    ]);
+    const { data: callRow } = await supabase
+      .from("calls").select("customer_name, tier").eq("id", callId).maybeSingle();
 
-    const messages = msgs || [];
     const customerName = callRow?.customer_name || null;
     const tier         = callRow?.tier          || "Regular";
 
-    const firstUserMsg    = messages.find((m) => m.role === "user");
-    const resolvedIntent  = firstUserMsg?.content?.slice(0, 150) || null;
-    const recentSnippet   = messages.slice(-6)
-      .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
-      .join("\n") || null;
-
-    const closingMessage = await generateClosingMessage(customerName, tier, recentSnippet, resolvedIntent);
+    const closingMessage = await generateClosingMessage(customerName, tier);
     return res.json({ closing_message: closingMessage });
   } catch (err) {
     console.error("[closing-message] error:", err.message);
