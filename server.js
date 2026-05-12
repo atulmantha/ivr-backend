@@ -269,7 +269,59 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
 // /api/twilio/ivr-query (IVR-captured user query).
 async function runAnalysisPipeline(callId, transcript) {
   try {
-    // Deduplicate: skip if another pipeline ran for this call within the last 12 seconds.
+    // Fetch call metadata and build the combined transcript early — needed by both
+    // the closing check (which must run before dedup) and the main analysis.
+    const { data: callData } = await supabase
+      .from("calls").select("*").eq("id", callId).maybeSingle();
+    const tier          = callData?.tier          || "Regular";
+    const customerName  = callData?.customer_name || null;
+    const customerPhone = callData?.customer_phone || null;
+
+    const fullTranscript = await getCombinedUserTranscript(callId, transcript);
+
+    // Fetch recent conversation history once — reused by closing check and reply generation.
+    const { data: recentMessages } = await supabase
+      .from("messages")
+      .select("role, content")
+      .eq("call_id", callId)
+      .order("created_at", { ascending: false })
+      .limit(6);
+    const conversationHistory = (recentMessages || []).reverse();
+
+    // ── Closing signal detection (runs BEFORE dedup so it's never throttled) ──
+    // Matches explicit thanks/farewell phrases OR standalone acknowledgement words.
+    const CLOSING_SIGNALS   = /\b(thank(s| you)|that'?s (fine|all|good|great|perfect|it|all i needed)|no (more|other|further) (questions?|issues?|concerns?|help|assistance)|nothing else|that'?ll (do|be all)|all good|sounds? good|issue (is )?resolved|bye|goodbye|take care)\b/i;
+    const STANDALONE_CLOSING = /^(okay|ok|alright|sure|perfect|great|fine|got it)[\.\!]?$/i;
+    const isClosingSignal = CLOSING_SIGNALS.test(fullTranscript) || STANDALONE_CLOSING.test(fullTranscript.trim());
+
+    if (isClosingSignal && conversationHistory.length >= 2) {
+      const { data: existingClosing } = await supabase
+        .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
+      if (!existingClosing) {
+        try {
+          const transcriptText = conversationHistory
+            .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
+            .join("\n");
+          const originalIssue = conversationHistory.find((m) => m.role === "user")?.content?.slice(0, 150) || null;
+          const closingMsg = await generateClosingMessage(customerName, tier, transcriptText, originalIssue);
+          if (closingMsg) {
+            await supabase.from("analysis").insert({
+              call_id:           callId,
+              emotion:           "calm",
+              intent:            "call_closing",
+              priority:          "low",
+              suggested_actions: [],
+              suggested_reply:   closingMsg,
+            });
+            console.log(`[analysis] Closing message auto-generated for callId=${callId}`);
+          }
+        } catch (closingErr) {
+          console.error("[analysis] Closing message generation failed:", closingErr.message);
+        }
+      }
+    }
+
+    // ── Dedup check for the main analysis pipeline ──
     // Multiple rapid STT fragments would otherwise each trigger separate Gemini calls,
     // exhausting the free-tier rate limit (15 RPM) before any reply is generated.
     const { data: recentRow } = await supabase
@@ -284,19 +336,10 @@ async function runAnalysisPipeline(callId, transcript) {
     if (recentRow) {
       const ageMs = Date.now() - new Date(recentRow.created_at).getTime();
       if (ageMs < 12_000) {
-        console.log(`[analysis] Skipping pipeline — last run was ${ageMs}ms ago (< 12s)`);
+        console.log(`[analysis] Skipping main analysis — last run was ${ageMs}ms ago (< 12s)`);
         return;
       }
     }
-
-    const { data: callData } = await supabase
-      .from("calls").select("*").eq("id", callId).maybeSingle();
-    const tier          = callData?.tier          || "Regular";
-    const customerName  = callData?.customer_name || null;
-    const customerPhone = callData?.customer_phone || null;
-
-    // Combine recent STT fragments so the AI understands the full sentence
-    const fullTranscript = await getCombinedUserTranscript(callId, transcript);
 
     const searchQuery = customerName ? `${customerName} ${fullTranscript}` : fullTranscript;
 
@@ -337,17 +380,7 @@ async function runAnalysisPipeline(callId, transcript) {
 
     try {
       const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
-
-      const customerData   = { name: customerName, tier, billingContext };
-
-      // Fetch recent conversation turns so the AI knows what was already answered
-      const { data: recentMessages } = await supabase
-        .from("messages")
-        .select("role, content")
-        .eq("call_id", callId)
-        .order("created_at", { ascending: false })
-        .limit(6);
-      const conversationHistory = (recentMessages || []).reverse();
+      const customerData  = { name: customerName, tier, billingContext };
 
       // Use the full combined transcript so the reply addresses the complete thought
       const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion, conversationHistory);
@@ -365,35 +398,6 @@ async function runAnalysisPipeline(callId, transcript) {
         });
       } else {
         console.warn("[analysis] generateSuggestedReply returned empty string");
-      }
-
-      // Auto-generate a closing message when the customer signals the conversation is wrapping up
-      const CLOSING_SIGNALS = /\b(thank(s| you)|that'?s (fine|all|good|great|perfect|it|all i needed)|no (more|other|further) (questions?|issues?|concerns?|help|assistance)|nothing else|that'?ll (do|be all)|all good|sounds? good|issue (is )?resolved|bye|goodbye|take care)\b/i;
-      if (CLOSING_SIGNALS.test(fullTranscript) && conversationHistory.length >= 2) {
-        const { data: existingClosing } = await supabase
-          .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
-        if (!existingClosing) {
-          try {
-            const transcript = conversationHistory
-              .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
-              .join("\n");
-            const originalIssue = conversationHistory.find((m) => m.role === "user")?.content?.slice(0, 150) || null;
-            const closingMsg = await generateClosingMessage(customerName, tier, transcript, originalIssue);
-            if (closingMsg) {
-              await supabase.from("analysis").insert({
-                call_id:           callId,
-                emotion:           "calm",
-                intent:            "call_closing",
-                priority:          "low",
-                suggested_actions: [],
-                suggested_reply:   closingMsg,
-              });
-              console.log(`[analysis] Closing message auto-generated for callId=${callId}`);
-            }
-          } catch (closingErr) {
-            console.error("[analysis] Closing message generation failed:", closingErr.message);
-          }
-        }
       }
     } catch (replyErr) {
       console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
