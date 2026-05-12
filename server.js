@@ -157,6 +157,7 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
                 statusCallbackEvent="end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
@@ -1216,6 +1217,7 @@ app.post("/api/twilio/agent-waiting", (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
                 statusCallbackEvent="end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
@@ -1295,6 +1297,7 @@ app.post("/api/twilio/queue-hold", (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
                 statusCallbackEvent="end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
@@ -1327,6 +1330,7 @@ app.post("/api/twilio/queue-connecting", (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
                 statusCallbackEvent="end"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST">
