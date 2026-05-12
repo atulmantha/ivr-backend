@@ -290,9 +290,14 @@ async function runAnalysisPipeline(callId, transcript) {
 
     // ── Closing signal detection (runs BEFORE dedup so it's never throttled) ──
     // Matches explicit thanks/farewell phrases OR standalone acknowledgement words.
-    const CLOSING_SIGNALS   = /\b(thank(s| you)|that'?s (fine|all|good|great|perfect|it|all i needed)|no (more|other|further) (questions?|issues?|concerns?|help|assistance)|nothing else|that'?ll (do|be all)|all good|sounds? good|issue (is )?resolved|bye|goodbye|take care)\b/i;
+    // Check raw `transcript` (always the latest customer message) AND `fullTranscript`
+    // (the combined DB fragments) — getCombinedUserTranscript can omit the latest
+    // message if it hasn't been saved to the DB yet when this pipeline runs.
+    const CLOSING_SIGNALS    = /\b(thank(s| you)|that'?s (fine|all|good|great|perfect|it|all i needed)|no (more|other|further) (questions?|issues?|concerns?|help|assistance)|nothing else|that'?ll (do|be all)|all good|sounds? good|issue (is )?resolved|bye|goodbye|take care)\b/i;
     const STANDALONE_CLOSING = /^(okay|ok|alright|sure|perfect|great|fine|got it)[\.\!]?$/i;
-    const isClosingSignal = CLOSING_SIGNALS.test(fullTranscript) || STANDALONE_CLOSING.test(fullTranscript.trim());
+    const isClosingSignal =
+      CLOSING_SIGNALS.test(transcript)       || CLOSING_SIGNALS.test(fullTranscript) ||
+      STANDALONE_CLOSING.test(transcript.trim()) || STANDALONE_CLOSING.test(fullTranscript.trim());
 
     if (isClosingSignal && conversationHistory.length >= 2) {
       const { data: existingClosing } = await supabase
