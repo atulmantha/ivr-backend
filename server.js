@@ -185,7 +185,7 @@ function agentConferenceTwiml(callId) {
                 endConferenceOnExit="true"
                 statusCallback="${statusUrl}"
                 statusCallbackMethod="POST"
-                statusCallbackEvent="end"
+                statusCallbackEvent="join end"
                 record="record-from-start"
                 recordingStatusCallback="${recordingStatusUrl}"
                 recordingStatusCallbackMethod="POST"
@@ -1389,6 +1389,16 @@ app.post("/api/conference-status", (req, res) => {
   const conferenceSid = req.body.ConferenceSid;
 
   console.log(`[conference-status] event=${event} role=${role} callId=${callId} confSid=${conferenceSid}`);
+
+  if (event === "participant-join" && role === "agent" && callId) {
+    supabase.from("calls").update({ status: "connected" })
+      .eq("id", callId)
+      .then(({ error }) => {
+        if (error) console.error("[conference-status] Agent-join status update:", error.message);
+        else console.log(`[conference-status] Call ${callId} marked connected ✓`);
+      });
+    return;
+  }
 
   if (event === "conference-end" && callId) {
     // Remove from queue first in case the customer hung up while waiting
