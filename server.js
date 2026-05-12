@@ -19,7 +19,7 @@ const cors     = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const twilio   = require("twilio");
 const { analyzeCustomerSpeech }                            = require("./decisionEngine");
-const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting } = require("./ragService");
+const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting, generateClosingMessage } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
 const { runMigrations }                                    = require("./migrate");
 const callQueue                                            = require("./queueManager");
@@ -1909,6 +1909,35 @@ Rules:
   } catch (err) {
     console.error("[call-summary] error:", err.message);
     return res.status(500).json({ error: "Failed to generate summary." });
+  }
+});
+
+// -- Closing message: AI-generated call wrap-up for the agent --
+app.get("/api/closing-message", async (req, res) => {
+  const callId = String(req.query.call_id || "").trim();
+  if (!callId) return res.status(400).json({ error: "call_id required" });
+
+  try {
+    const [{ data: callRow }, { data: msgs }] = await Promise.all([
+      supabase.from("calls").select("customer_name, tier, ivr_category").eq("id", callId).maybeSingle(),
+      supabase.from("messages").select("role, content").eq("call_id", callId).order("created_at", { ascending: true }),
+    ]);
+
+    const messages = msgs || [];
+    const customerName = callRow?.customer_name || null;
+    const tier         = callRow?.tier          || "Regular";
+
+    const firstUserMsg    = messages.find((m) => m.role === "user");
+    const resolvedIntent  = firstUserMsg?.content?.slice(0, 150) || null;
+    const recentSnippet   = messages.slice(-6)
+      .map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.content}`)
+      .join("\n") || null;
+
+    const closingMessage = await generateClosingMessage(customerName, tier, recentSnippet, resolvedIntent);
+    return res.json({ closing_message: closingMessage });
+  } catch (err) {
+    console.error("[closing-message] error:", err.message);
+    return res.status(500).json({ error: "Failed to generate closing message." });
   }
 });
 
