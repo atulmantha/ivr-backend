@@ -19,7 +19,7 @@ const cors     = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const twilio   = require("twilio");
 const { analyzeCustomerSpeech }                            = require("./decisionEngine");
-const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting, generateClosingMessage } = require("./ragService");
+const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting, generateClosingMessage, generateFinalFarewell } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
 const { runMigrations }                                    = require("./migrate");
 const callQueue                                            = require("./queueManager");
@@ -304,7 +304,7 @@ async function runAnalysisPipeline(callId, transcript) {
         .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
       if (!existingClosing) {
         try {
-          const closingMsg = await generateClosingMessage(customerName, tier);
+          const closingMsg = await generateClosingMessage(customerName);
           if (closingMsg) {
             await supabase.from("analysis").insert({
               call_id:           callId,
@@ -322,6 +322,38 @@ async function runAnalysisPipeline(callId, transcript) {
       }
     }
 
+    // ── Stage 2: Final farewell — triggered when customer says no/that's all
+    // after the closing card has already appeared (call_closing exists).
+    const FAREWELL_SIGNALS = /^(no|nope|no thanks|no thank you|that'?s all|nothing else|i'?m (good|fine|all set)|not? (really|now)|that will be all|i'?m done|nah)[\.\!\,]?$/i;
+    const isFarewellSignal = FAREWELL_SIGNALS.test(transcript.trim()) || FAREWELL_SIGNALS.test(fullTranscript.trim());
+
+    if (isFarewellSignal) {
+      const { data: existingClosing } = await supabase
+        .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
+      if (existingClosing) {
+        const { data: existingFarewell } = await supabase
+          .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_farewell").maybeSingle();
+        if (!existingFarewell) {
+          try {
+            const farewellMsg = await generateFinalFarewell(customerName);
+            if (farewellMsg) {
+              await supabase.from("analysis").insert({
+                call_id:           callId,
+                emotion:           "calm",
+                intent:            "call_farewell",
+                priority:          "low",
+                suggested_actions: [],
+                suggested_reply:   farewellMsg,
+              });
+              console.log(`[analysis] Final farewell auto-generated for callId=${callId}`);
+            }
+          } catch (farewellErr) {
+            console.error("[analysis] Final farewell generation failed:", farewellErr.message);
+          }
+        }
+      }
+    }
+
     // ── Dedup check for the main analysis pipeline ──
     // Multiple rapid STT fragments would otherwise each trigger separate Gemini calls,
     // exhausting the free-tier rate limit (15 RPM) before any reply is generated.
@@ -331,6 +363,7 @@ async function runAnalysisPipeline(callId, transcript) {
       .eq("call_id", callId)
       .neq("intent", "call_greeting")
       .neq("intent", "call_closing")
+      .neq("intent", "call_farewell")
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -1954,12 +1987,11 @@ app.get("/api/closing-message", async (req, res) => {
 
   try {
     const { data: callRow } = await supabase
-      .from("calls").select("customer_name, tier").eq("id", callId).maybeSingle();
+      .from("calls").select("customer_name").eq("id", callId).maybeSingle();
 
     const customerName = callRow?.customer_name || null;
-    const tier         = callRow?.tier          || "Regular";
 
-    const closingMessage = await generateClosingMessage(customerName, tier);
+    const closingMessage = await generateClosingMessage(customerName);
     return res.json({ closing_message: closingMessage });
   } catch (err) {
     console.error("[closing-message] error:", err.message);
