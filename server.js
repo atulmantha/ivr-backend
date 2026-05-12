@@ -1012,6 +1012,8 @@ app.post("/api/twilio/ivr-noinput", async (req, res) => {
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
+// Twilio fetches this URL the moment the agent accepts the incoming call,
+// so this is the earliest reliable point to mark the call connected.
 app.post("/api/twilio/agent", (req, res) => {
   res.set("Content-Type", "text/xml");
 
@@ -1019,6 +1021,13 @@ app.post("/api/twilio/agent", (req, res) => {
   if (!callId) {
     return res.send("<Response><Hangup/></Response>");
   }
+
+  supabase.from("calls").update({ status: "connected" })
+    .eq("id", callId)
+    .then(({ error }) => {
+      if (error) console.error("[agent-twiml] Status update:", error.message);
+      else console.log(`[agent-twiml] Call ${callId} marked connected ✓`);
+    });
 
   res.send(agentConferenceTwiml(callId));
 });
