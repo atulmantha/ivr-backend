@@ -180,24 +180,26 @@ async function generateSuggestedReply(
   return (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 }
 
-async function generateClosingMessage(customerName, tier = "Regular", transcriptSnippet, resolvedIntent) {
+async function generateClosingMessage(customerName, tier = "Regular", conversationTranscript, originalIssue) {
   const name = String(customerName || "").trim();
   const firstName = name.split(" ")[0] || null;
 
   const prompt = [
     `You are a call center agent wrapping up a support call with a ${tier} tier customer.`,
     name ? `Customer name: ${name}` : "",
-    resolvedIntent ? `The customer originally called about: ${resolvedIntent}` : "",
-    transcriptSnippet ? `Recent conversation:\n${transcriptSnippet}` : "",
+    originalIssue ? `The customer originally called about: ${originalIssue}` : "",
+    conversationTranscript ? `Conversation so far:\n${conversationTranscript}` : "",
     "",
-    "Write a short, professional closing message for the agent to say to end the call.",
+    "Based on the customer conversation and resolved issue, generate a short professional closing message for the agent to say.",
+    "The message should:",
+    "- Acknowledge the issue resolution",
+    "- Thank the customer for contacting support",
+    "- Ask if they need any further help",
+    "- End politely and professionally",
+    "",
     "Rules:",
     "- 2–3 sentences maximum.",
     firstName ? `- Address the customer by first name (${firstName}).` : "- Do not address the customer by name.",
-    "- Acknowledge the issue was resolved.",
-    "- Thank them for contacting support.",
-    "- Ask if they need any further assistance.",
-    "- End politely and professionally.",
     "- Voice-friendly: warm and natural, not robotic.",
     "- Do NOT mention any company name.",
     "Return only the closing message text — no labels, no quotes, no preamble.",
@@ -205,8 +207,8 @@ async function generateClosingMessage(customerName, tier = "Regular", transcript
 
   const key = process.env.GEMINI_API_KEY;
   const fallback = firstName
-    ? `I'm glad we could get that resolved for you, ${firstName}. Thank you so much for calling — is there anything else I can help you with today?`
-    : "I'm glad we could resolve that for you. Thank you for calling — is there anything else I can help you with today?";
+    ? `I'm glad we could get that resolved for you, ${firstName}. Thank you so much for contacting us — is there anything else I can help you with today?`
+    : "I'm glad we could resolve that for you. Thank you for contacting support — is there anything else I can help you with today?";
 
   try {
     const res = await fetch(`${GEMINI_GENERATE_URL}?key=${key}`, {
