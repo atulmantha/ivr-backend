@@ -362,7 +362,8 @@ async function runAnalysisPipeline(callId, transcript) {
     // (the combined DB fragments) — getCombinedUserTranscript can omit the latest
     // message if it hasn't been saved to the DB yet when this pipeline runs.
     const CLOSING_SIGNALS    = /\b(thank(s| you)|that'?s (fine|all|good|great|perfect|it|all i needed)|no (more|other|further) (questions?|issues?|concerns?|help|assistance)|nothing else|that'?ll (do|be all)|all good|sounds? good|issue (is )?resolved|bye|goodbye|take care)\b/i;
-    const STANDALONE_CLOSING = /^(okay|ok|alright|sure|perfect|great|fine|got it)[\.\!]?$/i;
+    // Exclude ambiguous mid-conversation words like okay/ok/alright/sure/perfect/great
+    const STANDALONE_CLOSING = /^(fine|got it|all (good|done|set))[\.\!]?$/i;
     const isClosingSignal =
       CLOSING_SIGNALS.test(transcript)       || CLOSING_SIGNALS.test(fullTranscript) ||
       STANDALONE_CLOSING.test(transcript.trim()) || STANDALONE_CLOSING.test(fullTranscript.trim());
@@ -370,7 +371,8 @@ async function runAnalysisPipeline(callId, transcript) {
       /\?/.test(transcript) ||
       /\b(what|when|why|how|which|where|who|can you|could you|may i|please tell|tell me)\b/i.test(transcript);
 
-    if (isClosingSignal && conversationHistory.length >= 2) {
+    // Require at least 3 conversation turns (greeting + ≥1 Q&A) before closing fires
+    if (isClosingSignal && conversationHistory.length >= 3) {
       const { data: existingClosing } = await supabase
         .from("analysis").select("id").eq("call_id", callId).eq("intent", "call_closing").maybeSingle();
       if (!existingClosing) {
