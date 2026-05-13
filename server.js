@@ -132,6 +132,30 @@ async function getAuditUserId(req) {
   }
 }
 
+function isMissingEncryptedColumnError(error) {
+  const message = String(error?.message || "");
+  return message.includes("content_encrypted") && message.includes("messages");
+}
+
+async function insertMessageWithEncryptionFallback({ call_id, role, content }) {
+  const encryptedPayload = {
+    call_id,
+    role,
+    content,
+    content_encrypted: encryptText(content),
+  };
+
+  const { error } = await supabase.from("messages").insert(encryptedPayload);
+  if (!error) return { error: null };
+
+  if (!isMissingEncryptedColumnError(error)) return { error };
+
+  const { error: fallbackError } = await supabase
+    .from("messages")
+    .insert({ call_id, role, content });
+  return { error: fallbackError || null };
+}
+
 async function lookupCustomerByPhone(rawPhone) {
   if (!rawPhone) return null;
 
@@ -251,13 +275,27 @@ async function fetchBillingFromKnowledgeBase(customerName) {
 // joins them so the AI sees the full intended sentence.
 async function getCombinedUserTranscript(callId, latestTranscript) {
   try {
-    const { data } = await supabase
+    let { data, error } = await supabase
       .from("messages")
       .select("content, content_encrypted, created_at")
       .eq("call_id", callId)
       .eq("role", "user")
       .order("created_at", { ascending: false })
       .limit(4);
+
+    if (error && isMissingEncryptedColumnError(error)) {
+      const fallback = await supabase
+        .from("messages")
+        .select("content, created_at")
+        .eq("call_id", callId)
+        .eq("role", "user")
+        .order("created_at", { ascending: false })
+        .limit(4);
+      data = fallback.data;
+      error = fallback.error;
+    }
+
+    if (error) return latestTranscript;
 
     if (!data || data.length === 0) return latestTranscript;
 
@@ -296,12 +334,24 @@ async function runAnalysisPipeline(callId, transcript) {
     const fullTranscript = await getCombinedUserTranscript(callId, transcript);
 
     // Fetch recent conversation history once — reused by closing check and reply generation.
-    const { data: recentMessages } = await supabase
+    let { data: recentMessages, error: recentMessagesError } = await supabase
       .from("messages")
       .select("role, content, content_encrypted")
       .eq("call_id", callId)
       .order("created_at", { ascending: false })
       .limit(6);
+    if (recentMessagesError && isMissingEncryptedColumnError(recentMessagesError)) {
+      const fallbackRecent = await supabase
+        .from("messages")
+        .select("role, content")
+        .eq("call_id", callId)
+        .order("created_at", { ascending: false })
+        .limit(6);
+      recentMessages = fallbackRecent.data;
+      recentMessagesError = fallbackRecent.error;
+    }
+    if (recentMessagesError) throw recentMessagesError;
+
     const conversationHistory = (recentMessages || [])
       .reverse()
       .map((m) => ({ ...m, content: decryptText(m.content_encrypted || m.content) }));
@@ -969,11 +1019,10 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
 
   if (callId && speech) {
     // Persist only the user's actual problem statement
-    supabase.from("messages").insert({
+    insertMessageWithEncryptionFallback({
       call_id: callId,
       role: "user",
       content: speech,
-      content_encrypted: encryptText(speech),
     })
       .then(({ error }) => {
         if (error) console.error("[ivr-query] Message insert error:", error.message);
@@ -1705,13 +1754,10 @@ app.post("/api/transcription", async (req, res) => {
 
   // Save the utterance to the messages table
   const dbRole = role === "agent" ? "agent" : "user";
-  supabase
-    .from("messages")
-    .insert({
+  insertMessageWithEncryptionFallback({
       call_id: callId,
       role: dbRole,
       content: transcript,
-      content_encrypted: encryptText(transcript),
     })
     .then(({ error }) => {
       if (error) console.error("[transcript] Message insert error:", error.message);
@@ -1856,10 +1902,30 @@ app.get("/api/call-summary", async (req, res) => {
   }
 
   try {
-    const [{ data: msgs }, { data: analyses }] = await Promise.all([
-      supabase.from("messages").select("role,content,content_encrypted,created_at").eq("call_id", callId).order("created_at", { ascending: true }),
-      supabase.from("analysis").select("*").eq("call_id", callId).order("created_at", { ascending: true }),
-    ]);
+    const analysisPromise = supabase
+      .from("analysis")
+      .select("*")
+      .eq("call_id", callId)
+      .order("created_at", { ascending: true });
+
+    let { data: msgs, error: msgsError } = await supabase
+      .from("messages")
+      .select("role,content,content_encrypted,created_at")
+      .eq("call_id", callId)
+      .order("created_at", { ascending: true });
+    if (msgsError && isMissingEncryptedColumnError(msgsError)) {
+      const fallbackMsgs = await supabase
+        .from("messages")
+        .select("role,content,created_at")
+        .eq("call_id", callId)
+        .order("created_at", { ascending: true });
+      msgs = fallbackMsgs.data;
+      msgsError = fallbackMsgs.error;
+    }
+    if (msgsError) throw msgsError;
+
+    const { data: analyses, error: analysesError } = await analysisPromise;
+    if (analysesError) throw analysesError;
 
     const allMsgs     = (msgs || []).map((m) => ({ ...m, content: decryptText(m.content_encrypted || m.content) }));
     const allAnalyses = (analyses || []).filter((a) => a.intent !== "call_greeting");
