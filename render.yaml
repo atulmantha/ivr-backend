@@ -5,15 +5,12 @@ services:
     buildCommand: NODE_OPTIONS=--max-old-space-size=512 npm install
     startCommand: node server.js
     envVars:
-      # ── Required ──────────────────────────────────────────────────
       - key: SUPABASE_URL
-        sync: false          # set manually in Render dashboard
+        sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-
-      # ── Twilio ───────────────────────────────────────────────────
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
@@ -26,15 +23,11 @@ services:
         sync: false
       - key: TWILIO_PHONE_NUMBER
         sync: false
-
-      # ── Deepgram ─────────────────────────────────────────────────
       - key: DEEPGRAM_API_KEY
         sync: false
-
-      # ── App base URL (set to your Render service URL) ──────────
       - key: APP_BASE_URL
         sync: false
-
-      # ── Optional ──────────────────────────────────────────────
+      - key: NOTES_ENCRYPTION_KEY
+        sync: false
       - key: CORS_ORIGIN
         sync: false
