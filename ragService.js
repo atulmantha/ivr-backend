@@ -116,9 +116,15 @@ async function generateSuggestedReply(
       `Then immediately give the concrete answer or resolution. Do not over-apologize — one empathy line, then the answer.`,
     ].join("\n");
   } else if (isConfused) {
-    toneInstruction = "The customer seems confused. Be reassuring and patient. Walk through the answer step by step in plain language.";
+    toneInstruction = [
+      "The customer seems confused. Start with a brief reassuring acknowledgement (e.g. \"Of course, happy to clarify that!\", \"Sure, let me explain that for you!\").",
+      "Then walk through the answer clearly and simply in plain language.",
+    ].join("\n");
   } else {
-    toneInstruction = "Use a warm, professional, and helpful tone throughout.";
+    toneInstruction = [
+      "Start with a brief friendly acknowledgement (e.g. \"Sure!\", \"Of course!\", \"Happy to help with that!\").",
+      "Then give the answer in a warm, professional tone.",
+    ].join("\n");
   }
 
   const historySection = conversationHistory.length > 0
