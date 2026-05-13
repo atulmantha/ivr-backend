@@ -146,10 +146,13 @@ async function generateSuggestedReply(
     "Write the exact words the agent should say to the customer.",
     "Rules:",
     "- Answer ONLY the customer's LATEST question. Do NOT repeat or re-state information that was already given earlier in the conversation above.",
+    "- Treat the LATEST question as authoritative. If it asks a different detail than earlier turns (for example energy consumed vs bill amount), answer that latest detail specifically.",
     "- Do NOT start with 'Hello', 'Hi', or any greeting — go straight to addressing the concern.",
     "- Give a clear, helpful answer in 2-4 sentences. Include all relevant figures, dates, or details from the data above — do not be vague.",
     "- If the data contains specific values (amounts, dates, usage figures, charges), quote them explicitly.",
-    "- If the customer asked about something (e.g. energy consumption, specific charges) and that information is NOT in the data above, say so clearly and offer to escalate or investigate further — do NOT substitute an answer about something else.",
+    "- If the customer asked about something specific (e.g. energy consumed, specific charges) and that exact value is NOT in the data above, clearly say that exact value is not available in current records and offer to escalate or investigate further.",
+    "- Never substitute a different metric. Example: if asked for energy consumed, do NOT answer with due date or bill amount only.",
+    "- If the latest customer utterance is just a closing acknowledgement (such as 'okay thanks', 'thank you', 'bye') and it contains no new service question, return exactly: NO_REPLY_NEEDED",
     "- NEVER say 'I will look that up', 'let me check', or 'one moment' if the data is already present above — use it directly.",
     customerFirstName
       ? `- Use the customer's first name (${customerFirstName}) at most ONCE in the reply, only if it sounds natural. Do not use it in every sentence.`
