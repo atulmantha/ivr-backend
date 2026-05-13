@@ -153,6 +153,16 @@ CREATE TABLE IF NOT EXISTS agents (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- secure_notes (PII-redacted agent notes attached to a call)
+CREATE TABLE IF NOT EXISTS secure_notes (
+  id            UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  call_id       UUID        NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  agent_id      TEXT,
+  redacted_note TEXT        NOT NULL,
+  pii_detected  TEXT[]      NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Disable RLS (internal tool — prevents empty realtime payloads)
 ALTER TABLE customers      DISABLE ROW LEVEL SECURITY;
 ALTER TABLE bills          DISABLE ROW LEVEL SECURITY;
@@ -163,6 +173,7 @@ ALTER TABLE knowledge_base DISABLE ROW LEVEL SECURITY;
 ALTER TABLE recordings     DISABLE ROW LEVEL SECURITY;
 ALTER TABLE agents         DISABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs     DISABLE ROW LEVEL SECURITY;
+ALTER TABLE secure_notes   DISABLE ROW LEVEL SECURITY;
 
 -- Enable Realtime (errors ignored if already added)
 DO $$
