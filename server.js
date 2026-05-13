@@ -468,8 +468,11 @@ async function runAnalysisPipeline(callId, transcript) {
     if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
     else console.log(`[analysis] no billing context found for ${customerName || customerPhone}`);
 
-    // Pass billing context into analysis so suggested_actions are resolution-focused, not discovery-focused
-    const analysisResult = await analyzeCustomerSpeech(fullTranscript, tier, billingContext);
+    // Run analysis and KB search in parallel — they share no dependencies at this point
+    const [analysisResult, contextChunks] = await Promise.all([
+      analyzeCustomerSpeech(fullTranscript, tier, billingContext),
+      embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
+    ]);
 
     console.log(`[analysis] emotion=${analysisResult.emotion} intent=${analysisResult.intent} priority=${analysisResult.priority}`);
 
@@ -493,11 +496,10 @@ async function runAnalysisPipeline(callId, transcript) {
       .then(({ error }) => { if (error) console.error("[analysis] Priority update:", error.message); });
 
     try {
-      const contextChunks = embedding ? await searchKnowledge(supabase, embedding) : [];
       const customerData  = { name: customerName, tier, billingContext };
 
-      // Use the full combined transcript so the reply addresses the complete thought
-      const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion, conversationHistory);
+      // Use the raw latest transcript so the reply targets exactly what the customer just asked
+      const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData, analysisResult.emotion, conversationHistory);
       console.log(`[analysis] suggested reply generated: "${(suggestedReply || "").slice(0, 80)}"`);
 
       if (suggestedReply && suggestedReply !== "NO_REPLY_NEEDED") {
@@ -2164,6 +2166,68 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
 
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
 app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
+
+// -- Secure Notes ---------------------------------------------
+app.get("/api/secure-notes", async (req, res) => {
+  const callId = String(req.query.call_id || "").trim();
+  if (!callId) return res.status(400).json({ error: "call_id required" });
+
+  const { data, error } = await supabase
+    .from("secure_notes")
+    .select("id, call_id, agent_id, redacted_note, pii_detected, created_at")
+    .eq("call_id", callId)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    console.error("[secure-notes] GET error:", error.message);
+    return res.status(500).json({ error: "Failed to fetch notes." });
+  }
+  return res.json({ notes: data || [] });
+});
+
+app.post("/api/secure-notes", async (req, res) => {
+  const callId  = String(req.body.call_id  || "").trim();
+  const rawNote = String(req.body.raw_note || "").trim();
+  const agentId = String(req.body.agent_id || "").trim();
+
+  if (!callId || !rawNote) {
+    return res.status(400).json({ error: "call_id and raw_note are required." });
+  }
+
+  const redactedNote = maskSensitiveData(rawNote);
+
+  const piiDetected = [];
+  if (/\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/.test(rawNote)) piiDetected.push("email");
+  if (/(?:\b\d[ \-]*?){13,19}\b/.test(rawNote)) piiDetected.push("card");
+  if (/\+?\d[\d\-(). ]{6,}\d/.test(rawNote)) piiDetected.push("phone");
+
+  const { data, error } = await supabase
+    .from("secure_notes")
+    .insert({
+      call_id:       callId,
+      agent_id:      agentId || null,
+      redacted_note: redactedNote,
+      pii_detected:  piiDetected,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[secure-notes] POST error:", error.message);
+    return res.status(500).json({ error: "Failed to save note." });
+  }
+
+  const auditUserId = await getAuditUserId(req);
+  void logAuditEvent({
+    userId:     auditUserId,
+    actionType: "secure_note_created",
+    entityType: "secure_note",
+    entityId:   data.id,
+    metadata:   { call_id: callId, pii_detected: piiDetected },
+  });
+
+  return res.status(201).json({ note: data });
+});
 
 // -- Queue stats (dashboard) ----------------------------------
 // Returns per-category waiting counts and per-call wait times.
