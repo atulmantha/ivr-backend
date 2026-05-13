@@ -53,11 +53,23 @@ ALTER TABLE calls ADD COLUMN IF NOT EXISTS ivr_category TEXT;
 
 -- messages (live transcript)
 CREATE TABLE IF NOT EXISTS messages (
-  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-  call_id    UUID        NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
-  role       TEXT        NOT NULL,
-  content    TEXT        NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id                UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  call_id           UUID        NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  role              TEXT        NOT NULL,
+  content           TEXT        NOT NULL,
+  content_encrypted TEXT,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- audit_logs (secure access tracking)
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id     UUID,
+  action_type TEXT        NOT NULL,
+  entity_type TEXT        NOT NULL,
+  entity_id   TEXT,
+  metadata    JSONB,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- analysis (AI results)
@@ -150,6 +162,7 @@ ALTER TABLE analysis       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE knowledge_base DISABLE ROW LEVEL SECURITY;
 ALTER TABLE recordings     DISABLE ROW LEVEL SECURITY;
 ALTER TABLE agents         DISABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs     DISABLE ROW LEVEL SECURITY;
 
 -- Enable Realtime (errors ignored if already added)
 DO $$
