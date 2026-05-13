@@ -24,6 +24,9 @@ const { upload, extractText, chunkText }                   = require("./uploadSe
 const { runMigrations }                                    = require("./migrate");
 const callQueue                                            = require("./queueManager");
 const authRoutes                                           = require("./authRoutes");
+const { encryptText, decryptText }                         = require("./utils/encryption");
+const { maskSensitiveData, maskEmail, maskPhone }         = require("./utils/piiMasking");
+const { logAuditEvent }                                    = require("./utils/auditLogger");
 require("dotenv").config({ quiet: true });
 
 // ── App + HTTP server ─────────────────────────────────────────
@@ -114,6 +117,19 @@ function buildPhoneVariants(rawPhone) {
   }
 
   return Array.from(variants).filter(Boolean);
+}
+
+async function getAuditUserId(req) {
+  const authHeader = req.headers?.authorization;
+  if (!authHeader?.startsWith("Bearer ")) return null;
+
+  try {
+    const bearerToken = authHeader.slice(7);
+    const { data: { user } } = await supabase.auth.getUser(bearerToken);
+    return user?.id || null;
+  } catch {
+    return null;
+  }
 }
 
 async function lookupCustomerByPhone(rawPhone) {
@@ -237,7 +253,7 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
   try {
     const { data } = await supabase
       .from("messages")
-      .select("content, created_at")
+      .select("content, content_encrypted, created_at")
       .eq("call_id", callId)
       .eq("role", "user")
       .order("created_at", { ascending: false })
@@ -251,7 +267,7 @@ async function getCombinedUserTranscript(callId, latestTranscript) {
     const recentFragments = data
       .filter((m) => latestTime - new Date(m.created_at).getTime() < WINDOW_MS)
       .reverse()
-      .map((m) => String(m.content || "").trim())
+      .map((m) => String(decryptText(m.content_encrypted || m.content) || "").trim())
       .filter(Boolean);
 
     const combined = recentFragments.join(" ");
@@ -282,11 +298,13 @@ async function runAnalysisPipeline(callId, transcript) {
     // Fetch recent conversation history once — reused by closing check and reply generation.
     const { data: recentMessages } = await supabase
       .from("messages")
-      .select("role, content")
+      .select("role, content, content_encrypted")
       .eq("call_id", callId)
       .order("created_at", { ascending: false })
       .limit(6);
-    const conversationHistory = (recentMessages || []).reverse();
+    const conversationHistory = (recentMessages || [])
+      .reverse()
+      .map((m) => ({ ...m, content: decryptText(m.content_encrypted || m.content) }));
 
     // ── Closing signal detection (runs BEFORE dedup so it's never throttled) ──
     // Matches explicit thanks/farewell phrases OR standalone acknowledgement words.
@@ -947,11 +965,16 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
   const category = String(req.query.category || "general").trim();
   const speech   = String(req.body.SpeechResult || "").trim();
 
-  console.log(`[ivr-query] callId=${callId} category=${category} speech="${speech.slice(0, 80)}"`);
+  console.log(`[ivr-query] callId=${callId} category=${category} speech="${maskSensitiveData(speech).slice(0, 80)}"`);
 
   if (callId && speech) {
     // Persist only the user's actual problem statement
-    supabase.from("messages").insert({ call_id: callId, role: "user", content: speech })
+    supabase.from("messages").insert({
+      call_id: callId,
+      role: "user",
+      content: speech,
+      content_encrypted: encryptText(speech),
+    })
       .then(({ error }) => {
         if (error) console.error("[ivr-query] Message insert error:", error.message);
         else console.log(`[ivr-query] User query saved ✓`);
@@ -1678,13 +1701,18 @@ app.post("/api/transcription", async (req, res) => {
     return;
   }
 
-  console.log(`[transcript] [${role}] "${transcript.slice(0, 120)}"`);
+  console.log(`[transcript] [${role}] "${maskSensitiveData(transcript).slice(0, 120)}"`);
 
   // Save the utterance to the messages table
   const dbRole = role === "agent" ? "agent" : "user";
   supabase
     .from("messages")
-    .insert({ call_id: callId, role: dbRole, content: transcript })
+    .insert({
+      call_id: callId,
+      role: dbRole,
+      content: transcript,
+      content_encrypted: encryptText(transcript),
+    })
     .then(({ error }) => {
       if (error) console.error("[transcript] Message insert error:", error.message);
       else console.log(`[transcript] Message saved ✓ role=${dbRole}`);
@@ -1808,6 +1836,15 @@ app.get("/api/call-summary", async (req, res) => {
   const force  = req.query.force === "true";
   if (!callId) return res.status(400).json({ error: "call_id required" });
 
+  const auditUserId = await getAuditUserId(req);
+  void logAuditEvent({
+    userId:     auditUserId,
+    actionType: "transcript_viewed",
+    entityType: "call",
+    entityId:   callId,
+    metadata:   { source: "call-summary" },
+  });
+
   // Return cached AI summary immediately unless the caller forced a refresh
   if (!force) {
     const { data: callRow } = await supabase
@@ -1820,11 +1857,11 @@ app.get("/api/call-summary", async (req, res) => {
 
   try {
     const [{ data: msgs }, { data: analyses }] = await Promise.all([
-      supabase.from("messages").select("role,content,created_at").eq("call_id", callId).order("created_at", { ascending: true }),
+      supabase.from("messages").select("role,content,content_encrypted,created_at").eq("call_id", callId).order("created_at", { ascending: true }),
       supabase.from("analysis").select("*").eq("call_id", callId).order("created_at", { ascending: true }),
     ]);
 
-    const allMsgs     = msgs     || [];
+    const allMsgs     = (msgs || []).map((m) => ({ ...m, content: decryptText(m.content_encrypted || m.content) }));
     const allAnalyses = (analyses || []).filter((a) => a.intent !== "call_greeting");
     const latest      = allAnalyses[allAnalyses.length - 1] || null;
     const customerCt  = allMsgs.filter((m) => m.role === "user").length;
@@ -2024,6 +2061,21 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
     }
 
     if (!data) return res.status(404).json({ error: "Customer not found." });
+
+    const auditUserId = await getAuditUserId(req);
+    void logAuditEvent({
+      userId:     auditUserId,
+      actionType: "customer_details_accessed",
+      entityType: "customer",
+      entityId:   data.id,
+      metadata:   {
+        query: {
+          id:    id || null,
+          email: email ? maskEmail(email) : null,
+          phone: phone ? maskPhone(phone) : null,
+        },
+      },
+    });
 
     return res.json({ customer: data });
   } catch (err) {
