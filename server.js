@@ -366,6 +366,9 @@ async function runAnalysisPipeline(callId, transcript) {
     const isClosingSignal =
       CLOSING_SIGNALS.test(transcript)       || CLOSING_SIGNALS.test(fullTranscript) ||
       STANDALONE_CLOSING.test(transcript.trim()) || STANDALONE_CLOSING.test(fullTranscript.trim());
+    const hasQuestionSignal =
+      /\?/.test(transcript) ||
+      /\b(what|when|why|how|which|where|who|can you|could you|may i|please tell|tell me)\b/i.test(transcript);
 
     if (isClosingSignal && conversationHistory.length >= 2) {
       const { data: existingClosing } = await supabase
@@ -420,6 +423,13 @@ async function runAnalysisPipeline(callId, transcript) {
           }
         }
       }
+    }
+
+    // If customer utterance is only a closing/farewell acknowledgement and has no
+    // new question intent, don't generate another general suggestion card.
+    if ((isClosingSignal || isFarewellSignal) && !hasQuestionSignal) {
+      console.log("[analysis] Closing/farewell-only utterance detected; skipping main suggestion generation");
+      return;
     }
 
     // ── Dedup check for the main analysis pipeline ──
@@ -488,7 +498,7 @@ async function runAnalysisPipeline(callId, transcript) {
       const suggestedReply = await generateSuggestedReply(fullTranscript, contextChunks, tier, customerData, analysisResult.emotion, conversationHistory);
       console.log(`[analysis] suggested reply generated: "${(suggestedReply || "").slice(0, 80)}"`);
 
-      if (suggestedReply) {
+      if (suggestedReply && suggestedReply !== "NO_REPLY_NEEDED") {
         const analysisId = savedRows?.[0]?.id;
         const updateQuery = analysisId
           ? supabase.from("analysis").update({ suggested_reply: suggestedReply }).eq("id", analysisId)
@@ -499,7 +509,7 @@ async function runAnalysisPipeline(callId, transcript) {
           else console.log("[analysis] Suggested reply saved ✓");
         });
       } else {
-        console.warn("[analysis] generateSuggestedReply returned empty string");
+        console.warn("[analysis] generateSuggestedReply returned empty/no-op reply");
       }
     } catch (replyErr) {
       console.error("[analysis] Suggested reply failed (basic analysis still saved):", replyErr.message);
