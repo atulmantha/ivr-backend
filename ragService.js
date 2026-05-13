@@ -63,6 +63,7 @@ async function generateGreeting(customerName, tier = "Regular") {
     "- Maximum 2 sentences.",
     "- Use the customer's first name.",
     "- Do NOT mention any company name.",
+    "- Do NOT introduce the agent by name. Do NOT use any placeholder like '[Agent Name]' or similar.",
     "- Keep it natural and conversational — not robotic.",
     "- Voice-friendly: short, clear sentences.",
     "Return only the greeting text — no labels, no quotes, no preamble.",
@@ -116,15 +117,9 @@ async function generateSuggestedReply(
       `Then immediately give the concrete answer or resolution. Do not over-apologize — one empathy line, then the answer.`,
     ].join("\n");
   } else if (isConfused) {
-    toneInstruction = [
-      "The customer seems confused. Start with a brief reassuring acknowledgement (e.g. \"Of course, happy to clarify that!\", \"Sure, let me explain that for you!\").",
-      "Then walk through the answer clearly and simply in plain language.",
-    ].join("\n");
+    toneInstruction = "The customer seems confused. Be reassuring and patient. Open with a natural, varied acknowledgement (not the same phrase every time), then walk through the answer clearly and simply in plain language.";
   } else {
-    toneInstruction = [
-      "Start with a brief friendly acknowledgement (e.g. \"Sure!\", \"Of course!\", \"Happy to help with that!\").",
-      "Then give the answer in a warm, professional tone.",
-    ].join("\n");
+    toneInstruction = "Use a warm, professional tone. Open with a short, natural acknowledgement that varies across replies — do NOT repeat the same filler phrase (like 'Happy to help' or 'Sure') in every response.";
   }
 
   const historySection = conversationHistory.length > 0
